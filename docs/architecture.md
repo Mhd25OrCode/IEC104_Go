@@ -66,13 +66,21 @@ guarded by `sync.Mutex`:
 | 100 | single point (`bool`) | `spontaneousLoop` (toggle) and read replies |
 | 200 | double point (`DPIDeterminedOn`) | fixed at startup |
 | 300 | normalized measurement (`Normalize(10000)`) | fixed value in the GI response |
-| 301 | short-float measurement | `periodicLoop` (drifts +12.5, wraps 220 → −30) |
+| 301 | short-float measurement (`M_ME_NC_1`) | `periodicLoop` (drifts +12.5, wraps 220 → −30) |
+| 302 | time-tagged short-float measurement (`M_ME_TF_1`) | `spontaneousLoop` and the GI response (mirrors IOA 301) |
 | 400 | integrated totals counter | static in this demo |
+| — | bitstring-32 command output (`uint32`) | `OnASDU` (`C_BO_NA_1` / `C_BO_TA_1`), stored only |
 
 Implemented handler methods: `OnInterrogation`, `OnCounterInterrogation`,
 `OnRead`, `OnClockSync`, `OnResetProcess`, `OnDelayAcquisition`,
 `OnTestCommand`, and `OnASDU` (control commands: single / double / set-points /
-`C_TS_TA_1`).
+bitstring-32 (`C_BO_NA_1` / `C_BO_TA_1`) / `C_TS_TA_1`).
+
+`OnASDU` is the only handler that both consumes the received ASDU
+(`pack.Get*Cmd()`) **and** returns an error to cs104's dispatcher, which answers
+a non-nil error with `SendReplyMirror(UnknownTypeID)` — a mirror of an
+already-consumed ASDU. Its responses therefore go through `replyOrLog()`, which
+logs a failed send instead of propagating it.
 
 `startReporting` is idempotent per remote address (`sync.Map`) and is invoked
 from `OnInterrogation` (i.e. only after STARTDT is active). It launches, per
@@ -81,7 +89,8 @@ session:
 - `periodicLoop` — `M_ME_NC_1` IOA 301, COT = Periodic(1), every `-period`
   (default 3 s).
 - `spontaneousLoop` — `M_SP_TB_1` IOA 100, COT = Spontaneous(3), every
-  `-spontaneous` (default 2 s), toggling the single point.
+  `-spontaneous` (default 2 s), toggling the single point, followed by the
+  CP56-tagged analog `M_ME_TF_1` IOA 302.
 
 Both loops tolerate up to 30 consecutive send failures before stopping, so a
 dead socket cannot spin forever.
@@ -94,7 +103,12 @@ dead socket cannot spin forever.
   requested `Cause` (`ActivationCon`, `ActivationTerm`, `DeactivationCon`, …).
 - `confirm*` builders for `C_IC_NA_1`, `C_CI_NA_1`, `C_CS_NA_1`, `C_RP_NA_1`,
   `C_CD_NA_1`, `C_TS_TA_1`, `C_SC_NA_1/TA_1`, `C_DC_NA_1/TA_1`,
-  `C_SE_NA_1/TA_1`, `C_SE_NB_1/TB_1`, `C_SE_NC_1/TC_1`.
+  `C_SE_NA_1/TA_1`, `C_SE_NB_1/TB_1`, `C_SE_NC_1/TC_1`, `C_BO_NA_1/TA_1`.
+- `sendMeasuredFloatTime` — reports `M_ME_TF_1` (CP56-tagged short float) as a
+  fresh ASDU. Required because `asdu.MeasuredValueFloatCP56Time2a` accepts only
+  `COT` Spontaneous/Request and rejects the `Periodic`/`InterrogatedByStation`
+  causes this outstation uses; for the same reason `confirmBitsString32Cmd` is
+  hand-built (`asdu.BitsString32Cmd` accepts only `Activation`/`Deactivation`).
 
 Every confirmation is a **brand-new ASDU** assembled with
 `AppendInfoObjAddr` + `AppendBytes / AppendNormalize / AppendScaled /
@@ -114,7 +128,7 @@ AppendFloat32 / AppendCP56Time2a / AppendCP16Time2a` — never
 | `OnRead` | echoed `C_RD_NA_1` (normally unused — the server answers with data) |
 | `OnTestCommand` | untagged `C_TS_NA_1` replies |
 | `OnClockSync`, `OnResetProcess`, `OnDelayAcquisition` | respective confirmations |
-| `OnASDU` | everything else: monitoring data (single / double / measured-normal / measured-float / integrated totals) and command confirmations via `onCommandReply` (`C_TS_TA_1`, `C_SC_*`, `C_DC_*`, `C_SE_*`) |
+| `OnASDU` | everything else: monitoring data (single / double / measured-normal / measured-float — including the CP56-tagged `M_ME_TF_1`, logged with its type id — / integrated totals) and command confirmations via `onCommandReply` (`C_TS_TA_1`, `C_SC_*`, `C_DC_*`, `C_SE_*`, `C_BO_*`) |
 
 ---
 
@@ -154,6 +168,8 @@ Fired once STARTDT is confirmed, in this order:
 | 7 | Single command | `SendCmd(ca, C_SC_NA_1, 1000, true)` | IOA 1000 |
 | 8 | Double command | `SendCmd(ca, C_DC_NA_1, 2000, DPIDeterminedOn)` | IOA 2000 |
 | 9 | Set-point float | `SendCmd(ca, C_SE_NC_1, 3000, 125.5)` | IOA 3000 |
+| 10 | Bitstring-32, time-tagged | `SendCmd(ca, C_BO_TA_1, 4000, 0x00FF00FF)` | IOA 4000 — sent, but dropped by the peer's decoder (Bug 3, §4) |
+| 11 | Bitstring-32, untagged | `SendCmd(ca, C_BO_NA_1, 4001, 0x0F0F0F0F)` | IOA 4001 — round-trip verified |
 
 ### 2.3 Typical exchanges
 
@@ -174,6 +190,10 @@ client                                              server (station.OnInterrogat
 
 A `Deactivation(8)` GI is answered with `DeactivationCon(9)` instead.
 
+The interrogated data is `M_SP_NA_1` (IOA 100), `M_DP_NA_1` (200),
+`M_ME_NA_1` (300), `M_ME_NC_1` (301) and the CP56-tagged `M_ME_TF_1` (302), all
+with `COT=20`.
+
 **Counter interrogation** — same three-step pattern:
 `C_CI_NA_1 Activation` → `ActivationCon` → `M_IT_NA_1` (IOA 400, COT 37) →
 `ActivationTerm`.
@@ -181,7 +201,8 @@ A `Deactivation(8)` GI is answered with `DeactivationCon(9)` instead.
 **All other commands** — request `COT=Activation(6)`, then one fresh
 `ActivationCon(7)` confirmation echoing the request parameters
 (`C_CS_NA_1` echoes the CP56Time2a; `C_TS_TA_1` echoes the FBP test word +
-time; `C_CD_NA_1` echoes the CP16Time2a). A **read** command is answered with
+time; `C_CD_NA_1` echoes the CP16Time2a; `C_BO_NA_1`/`C_BO_TA_1` echo the 32-bit
+bitstring, the `TA` variant plus its CP56Time2a). A **read** command is answered with
 the current value as `M_SP_NA_1 COT=Request(5)`.
 
 **Background reporting** (per session, after the first GI):
@@ -189,6 +210,7 @@ the current value as `M_SP_NA_1 COT=Request(5)`.
 ```text
 periodicLoop    : every -period      → M_ME_NC_1  IOA 301  COT=Periodic(1)     value += 12.5
 spontaneousLoop : every -spontaneous → M_SP_TB_1  IOA 100  COT=Spontaneous(3)  toggle bool
+spontaneousLoop : every -spontaneous → M_ME_TF_1  IOA 302  COT=Spontaneous(3)  analog (CP56-tagged)
 ```
 
 ### 2.4 Build & run
@@ -203,6 +225,10 @@ cd iec104_client; go build ./...
 
 # terminal 2 — master
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s
+
+# add -verbose to either program to print the raw cs104 frame/decode log;
+# that is how the silent C_BO_TA_1 drop (Bug 3, §4) becomes visible
+.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s -verbose
 ```
 
 ## 3. ASDUs used
@@ -223,6 +249,8 @@ cd iec104_client; go build ./...
 | `C_SE_NA_1` / `C_SE_TA_1` | Set-point, normalized | Activation(6) | `station.OnASDU` |
 | `C_SE_NB_1` / `C_SE_TB_1` | Set-point, scaled | Activation(6) | `station.OnASDU` (demo client sends only `C_SE_NC_1`) |
 | `C_SE_NC_1` / `C_SE_TC_1` | Set-point, short float | Activation(6) | `station.OnASDU` |
+| `C_BO_NA_1` | Bitstring of 32 bits, command | Activation(6) | `station.OnASDU` — round-trip verified |
+| `C_BO_TA_1` | Bitstring of 32 bits, command, with CP56Time2a | Activation(6) | `station.OnASDU` — handled here, but the frame never reaches the handler on the unpatched library (Bug 3, §4) |
 
 ### 3.2 Monitoring direction (outstation → master)
 
@@ -233,6 +261,7 @@ cd iec104_client; go build ./...
 | `M_DP_NA_1` | Double point | InterrogatedByStation(20) | `sendAllData` |
 | `M_ME_NA_1` | Measured value, normalized | InterrogatedByStation(20) | `sendAllData` |
 | `M_ME_NC_1` | Measured value, short float | InterrogatedByStation(20), Periodic(1) | `sendAllData`, `periodicLoop` |
+| `M_ME_TF_1` | Measured value, short float + CP56Time2a | InterrogatedByStation(20), Spontaneous(3) | `sendAllData` (hand-built), `spontaneousLoop` (library helper) — IOA 302 |
 | `M_IT_NA_1` | Integrated totals | RequestByGeneralCounter(37) | `sendCounters` |
 
 ### 3.3 Confirmations sent by the server
@@ -309,6 +338,31 @@ confirmations are hand-built in `confirm.go`.
 > Treat an ASDU as consumed after calling `Get*Cmd()`. Do not mirror it
 > afterward — use the received ASDU to extract information, then construct a
 > **new** ASDU for the response.
+
+### Bug 3 — `infoObjSize` has no entry for the time-tagged command types
+
+Found while adding `C_BO_TA_1`. `asdu.infoObjSize` (go-iecp5
+`asdu/identifier.go`) maps a type identification to its serial info-object size
+and is consulted by **every** `UnmarshalBinary` (via `fixInfoObjSize`). It
+contains the untagged `C_*_NA_1` commands but **none** of
+`C_SC_TA_1`, `C_DC_TA_1`, `C_RC_TA_1`, `C_SE_TA_1`, `C_SE_TB_1`, `C_SE_TC_1`,
+`C_BO_TA_1` (`C_TS_TA_1` is the only registered `TA` type), so a received frame
+of those types is dropped before any handler runs:
+
+```text
+cs104 server => [E]: asdu UnmarshalBinary failed,asdu: type identification unknown
+```
+
+The error is invisible by default: `clog` starts disabled, and
+`sf.Error()`/`sf.Warn()` print nothing until `LogMode(true)` — hence the
+`-verbose` flag in both programs. Verified A/B with the same client session:
+`C_BO_NA_1` (registered) is decoded → `[server] bitstring32 command: IOA=4001
+value=0x0F0F0F0F` → `ActivationCon` confirmation received, while `C_BO_TA_1`
+(not registered) produces the log line above and no handler call. The sender
+never sees an error. `infoObjSize` is unexported and there is no registration
+API, so there is **no application-level workaround** — only a patched library
+(or the untagged `C_BO_NA_1`, which this repo uses by default) makes
+`C_BO_TA_1` complete a round-trip. See the bug report §14.
 
 See `iec_60870_5_104_bug_report.md` for the full analysis, the list of
 verified-working functions, and the updated status table.

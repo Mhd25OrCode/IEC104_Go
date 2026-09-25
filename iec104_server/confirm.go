@@ -17,7 +17,11 @@ func coa(cause asdu.Cause) asdu.CauseOfTransmission {
 	return asdu.CauseOfTransmission{Cause: cause}
 }
 
-// newCommandASDU builds a fresh command ASDU (SQ=0, single info object).
+// newCommandASDU builds a fresh single-object ASDU (SQ=0, Number=1).
+//
+// It is named after its main use (command confirmations) but is deliberately
+// generic: it is also the base for hand-built monitoring ASDUs, because the
+// library's own monitoring helpers restrict the cause of transmission.
 func newCommandASDU(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca asdu.CommonAddr) *asdu.ASDU {
 	return asdu.NewASDU(conn.Params(), asdu.Identifier{
 		Type:       typeID,
@@ -25,6 +29,23 @@ func newCommandASDU(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca 
 		Coa:        coa(cause),
 		CommonAddr: ca,
 	})
+}
+
+// sendMeasuredFloatTime reports a short-float measurement with a CP56Time2a
+// time tag (M_ME_TF_1) as a brand-new ASDU.
+//
+// It cannot use asdu.MeasuredValueFloatCP56Time2a: that helper accepts only
+// COT Spontaneous(3)/Request(5) and returns ErrCmdCause for Periodic(1) or
+// InterrogatedByStation(20), both of which this outstation needs. The QDS mask
+// (& 0xf1) mirrors the library's own measuredValueFloat() encoder.
+func sendMeasuredFloatTime(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr, info asdu.MeasuredValueFloatInfo) error {
+	u := newCommandASDU(conn, asdu.M_ME_TF_1, cause, ca)
+	if err := u.AppendInfoObjAddr(info.Ioa); err != nil {
+		return err
+	}
+	u.AppendFloat32(info.Value).AppendBytes(byte(info.Qds & 0xf1))
+	u.AppendCP56Time2a(info.Time, conn.Params().InfoObjTimeZone)
+	return conn.Send(u)
 }
 
 // confirmInterrogation sends a C_IC_NA_1 confirmation/termination
@@ -156,6 +177,28 @@ func confirmSetpointScaled(conn asdu.Connect, typeID asdu.TypeID, ca asdu.Common
 	}
 	u.AppendScaled(cmd.Value).AppendBytes(cmd.Qos.Value())
 	if typeID == asdu.C_SE_TB_1 {
+		u.AppendCP56Time2a(cmd.Time, conn.Params().InfoObjTimeZone)
+	}
+	return conn.Send(u)
+}
+
+// confirmBitsString32Cmd echoes a 32-bit bitstring command (C_BO_NA_1) as an
+// activation confirmation; the C_BO_TA_1 variant also echoes its CP56Time2a.
+//
+// Hand-built like every other confirmation here: asdu.BitsString32Cmd accepts
+// only COT Activation(6)/Deactivation(8) and therefore cannot emit the
+// ActivationCon(7) confirmation, and mirroring is unsafe after
+// pack.GetBitsString32Cmd() has consumed the received ASDU.
+func confirmBitsString32Cmd(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr, cmd asdu.BitsString32CommandInfo) error {
+	if typeID != asdu.C_BO_NA_1 && typeID != asdu.C_BO_TA_1 {
+		return asdu.ErrTypeIDNotMatch
+	}
+	u := newCommandASDU(conn, typeID, asdu.ActivationCon, ca)
+	if err := u.AppendInfoObjAddr(cmd.Ioa); err != nil {
+		return err
+	}
+	u.AppendBitsString32(cmd.Value)
+	if typeID == asdu.C_BO_TA_1 {
 		u.AppendCP56Time2a(cmd.Time, conn.Params().InfoObjTimeZone)
 	}
 	return conn.Send(u)

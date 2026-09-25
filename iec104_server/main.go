@@ -21,11 +21,18 @@ func main() {
 	period := flag.Duration("period", 3*time.Second, "periodic reporting interval")
 	spont := flag.Duration("spontaneous", 2*time.Second, "spontaneous reporting interval")
 	duration := flag.Duration("duration", 0, "run for this long, then exit (0 = until Ctrl+C)")
+	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors)")
 	flag.Parse()
 
 	settings := server.NewSettings()
 	settings.Host = *host
 	settings.Port = *port
+	if *verbose {
+		// Library logs are off by default: cs104 swallows ASDU decode errors
+		// (e.g. the C_BO_TA_1 drop documented in iec_60870_5_104_bug_report.md
+		// "Bug 3") behind sf.Error(), which prints nothing unless LogMode(true).
+		settings.LogCfg = &server.LogCfg{Enable: true}
+	}
 
 	st := &station{
 		ca:     asdu.CommonAddr(*ca),

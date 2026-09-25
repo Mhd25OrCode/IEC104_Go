@@ -18,6 +18,7 @@ type station struct {
 	dpVal   asdu.DoublePoint
 	ana     float32
 	counter int32
+	bits    uint32 // last C_BO_NA_1 / C_BO_TA_1 bitstring command applied to the process image
 
 	started sync.Map // remote addr string -> struct{}: one reporting pair per live session
 	period  time.Duration
@@ -63,6 +64,8 @@ func (st *station) periodicLoop(conn asdu.Connect) {
 
 // spontaneousLoop toggles a binary input and reports it (M_SP_TB_1, COT=3).
 // The flip-flop is owned by this loop so reporting alternates deterministically.
+// Each tick also reports the drifting analog as a time-tagged measurement
+// (M_ME_TF_1, IOA 302, COT=3) via the library helper.
 func (st *station) spontaneousLoop(conn asdu.Connect) {
 	fails := 0
 	v := st.spVal
@@ -71,6 +74,7 @@ func (st *station) spontaneousLoop(conn asdu.Connect) {
 		v = !v
 		st.mu.Lock()
 		st.spVal = v
+		ana := st.ana
 		st.mu.Unlock()
 		err := asdu.SingleCP56Time2a(conn, coa(asdu.Spontaneous), st.ca, asdu.SinglePointInfo{
 			Ioa:   100,
@@ -78,6 +82,15 @@ func (st *station) spontaneousLoop(conn asdu.Connect) {
 			Qds:   asdu.QDSGood,
 			Time:  time.Now(),
 		})
+		if err == nil {
+			err = asdu.MeasuredValueFloatCP56Time2a(conn, coa(asdu.Spontaneous), st.ca,
+				asdu.MeasuredValueFloatInfo{
+					Ioa:   302,
+					Value: ana,
+					Qds:   asdu.QDSGood,
+					Time:  time.Now(),
+				})
+		}
 		if err != nil {
 			fails++
 			if fails > 30 {
@@ -90,7 +103,9 @@ func (st *station) spontaneousLoop(conn asdu.Connect) {
 }
 
 // sendAllData reports the whole process image with COT=20 (station
-// interrogation response).
+// interrogation response): single point, double point, normalized measurement,
+// short-float measurement (M_ME_NC_1) and the time-tagged short-float
+// measurement (M_ME_TF_1, IOA 302).
 func (st *station) sendAllData(conn asdu.Connect) error {
 	st.mu.Lock()
 	sp, dp, ana := st.spVal, st.dpVal, st.ana
@@ -108,8 +123,14 @@ func (st *station) sendAllData(conn asdu.Connect) error {
 		asdu.MeasuredValueNormalInfo{Ioa: 300, Value: asdu.Normalize(10000), Qds: asdu.QDSGood}); err != nil {
 		return err
 	}
-	return asdu.MeasuredValueFloat(conn, false, coa(asdu.InterrogatedByStation), st.ca,
-		asdu.MeasuredValueFloatInfo{Ioa: 301, Value: ana, Qds: asdu.QDSGood})
+	if err := asdu.MeasuredValueFloat(conn, false, coa(asdu.InterrogatedByStation), st.ca,
+		asdu.MeasuredValueFloatInfo{Ioa: 301, Value: ana, Qds: asdu.QDSGood}); err != nil {
+		return err
+	}
+	// The same analog reported with a CP56Time2a tag (M_ME_TF_1). Hand-built,
+	// because asdu.MeasuredValueFloatCP56Time2a rejects COT 20.
+	return sendMeasuredFloatTime(conn, asdu.InterrogatedByStation, st.ca,
+		asdu.MeasuredValueFloatInfo{Ioa: 302, Value: ana, Qds: asdu.QDSGood, Time: time.Now()})
 }
 
 // sendCounters reports integrated totals with COT=37 (response to a general
@@ -193,33 +214,58 @@ func (st *station) OnTestCommand(conn asdu.Connect, _ *asdu.ASDU) error {
 	return confirmTestCommand(conn, st.ca, time.Now())
 }
 
+// replyOrLog reports a confirmation send failure without propagating it to the
+// library dispatcher.
+//
+// cs104's server_session.go answers a non-nil ASDUHandler error with
+// asduPack.SendReplyMirror(sf, asdu.UnknownTypeID). That mirror would be built
+// from an ASDU whose info-object buffer was already consumed by Get*Cmd(), so it
+// would arrive empty/truncated and the peer would fail with
+// "asdu UnmarshalBinary failed, EOF" (see iec_60870_5_104_bug_report.md §1-§4).
+// Logging the failure here instead keeps the wire clean; the socket is broken
+// anyway if a send failed.
+func replyOrLog(conn asdu.Connect, err error) error {
+	if err != nil {
+		fmt.Printf("[server] confirmation send failed (%s): %v\n", conn.UnderlyingConn().RemoteAddr(), err)
+	}
+	return nil
+}
+
 // OnASDU handles control commands routed through ASDUHandler and echoes a
-// fresh ActivationCon confirmation for each of them.
+// fresh ActivationCon confirmation for each of them (never a mirror of the
+// consumed request).
 func (st *station) OnASDU(conn asdu.Connect, pack *asdu.ASDU) error {
 	switch pack.Type {
 	case asdu.C_TS_TA_1:
 		fmt.Println("[server] test command (C_TS_TA_1)")
-		return confirmTestCommand(conn, st.ca, time.Now())
+		return replyOrLog(conn, confirmTestCommand(conn, st.ca, time.Now()))
 	case asdu.C_SC_NA_1, asdu.C_SC_TA_1:
 		sc := pack.GetSingleCmd()
 		fmt.Printf("[server] single command: IOA=%d value=%v COT=%v\n", sc.Ioa, sc.Value, pack.Identifier.Coa)
-		return confirmSingleCmd(conn, pack.Type, st.ca, sc)
+		return replyOrLog(conn, confirmSingleCmd(conn, pack.Type, st.ca, sc))
 	case asdu.C_DC_NA_1, asdu.C_DC_TA_1:
 		dc := pack.GetDoubleCmd()
 		fmt.Printf("[server] double command: IOA=%d value=%d COT=%v\n", dc.Ioa, dc.Value, pack.Identifier.Coa)
-		return confirmDoubleCmd(conn, pack.Type, st.ca, dc)
+		return replyOrLog(conn, confirmDoubleCmd(conn, pack.Type, st.ca, dc))
+	case asdu.C_BO_NA_1, asdu.C_BO_TA_1:
+		bc := pack.GetBitsString32Cmd()
+		fmt.Printf("[server] bitstring32 command: IOA=%d value=0x%08X COT=%v\n", bc.Ioa, bc.Value, pack.Identifier.Coa)
+		st.mu.Lock()
+		st.bits = bc.Value
+		st.mu.Unlock()
+		return replyOrLog(conn, confirmBitsString32Cmd(conn, pack.Type, st.ca, bc))
 	case asdu.C_SE_NA_1, asdu.C_SE_TA_1:
 		sp := pack.GetSetpointNormalCmd()
 		fmt.Printf("[server] setpoint normal command: IOA=%d value=%v COT=%v\n", sp.Ioa, sp.Value, pack.Identifier.Coa)
-		return confirmSetpointNormal(conn, pack.Type, st.ca, sp)
+		return replyOrLog(conn, confirmSetpointNormal(conn, pack.Type, st.ca, sp))
 	case asdu.C_SE_NB_1, asdu.C_SE_TB_1:
 		sp := pack.GetSetpointCmdScaled()
 		fmt.Printf("[server] setpoint scaled command: IOA=%d value=%v COT=%v\n", sp.Ioa, sp.Value, pack.Identifier.Coa)
-		return confirmSetpointScaled(conn, pack.Type, st.ca, sp)
+		return replyOrLog(conn, confirmSetpointScaled(conn, pack.Type, st.ca, sp))
 	case asdu.C_SE_NC_1, asdu.C_SE_TC_1:
 		sp := pack.GetSetpointFloatCmd()
 		fmt.Printf("[server] setpoint float command: IOA=%d value=%v COT=%v\n", sp.Ioa, sp.Value, pack.Identifier.Coa)
-		return confirmSetpointFloat(conn, pack.Type, st.ca, sp)
+		return replyOrLog(conn, confirmSetpointFloat(conn, pack.Type, st.ca, sp))
 	default:
 		fmt.Printf("[server] unhandled ASDU: type=%v COT=%v\n", pack.Type, pack.Identifier.Coa)
 		return nil

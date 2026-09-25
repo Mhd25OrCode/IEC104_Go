@@ -30,6 +30,14 @@ ActivationTerm
 ```
 was not successfully observed by the client. This is a separate issue from the `SendReplyMirror()` problem.
 
+### Bug 3 — `asdu.infoObjSize` is missing entries for Type IDs 58–64 (upstream `go-iecp5`)
+The upstream ASDU codec (`github.com/wendy512/go-iecp5`, `asdu/identifier.go`)
+defines Type IDs 58–64 (`C_SC_TA_1` … `C_BO_TA_1`) but omits all seven from its
+`infoObjSize` table. `UnmarshalBinary` relies on `GetInfoObjSize()` to determine
+how much data to consume for an Information Object, so every frame of those types
+fails to decode (`ErrTypeIdentifier`, "asdu: type identification unknown") before
+any handler runs. Still present in `v1.2.6` — see §14.
+
 ---
 
 ## 2. Bug #1 — `SendReplyMirror()` + `Get*Cmd()`
@@ -375,3 +383,236 @@ Verified with the reference implementation in live logs:
 | Periodic data | ✅ Working |
 | Spontaneous data | ✅ Working |
 | `SendReplyMirror()` after `Get*Cmd()` | ❌ Avoid (blank info body) |
+| `C_BO_TA_1` (application level) | ⚠ Implemented — blocked by the upstream `infoObjSize` defect (Bug 3, §14) |
+
+---
+
+## 14. Bug 3 — `asdu.infoObjSize` is missing entries for Type IDs 58–64 (upstream defect in `github.com/wendy512/go-iecp5`)
+
+### 14.1 Title
+
+**`asdu.infoObjSize` has no entry for the time-tagged command type group
+`C_SC_TA_1`, `C_DC_TA_1`, `C_RC_TA_1`, `C_SE_TA_1`, `C_SE_TB_1`, `C_SE_TC_1`,
+`C_BO_TA_1` (Type IDs 58–64), so frames of those types cannot be unmarshaled by
+`ASDU.UnmarshalBinary`.**
+
+### 14.2 Description
+
+Found while adding `C_BO_TA_1` to this repository; confirmed to affect the whole
+time-tagged command group 58–64.
+
+`asdu.infoObjSize` (`go-iecp5/asdu/identifier.go`) is an unexported
+`map[TypeID]int` that maps a type identification to the serial octet size of one
+information object. `ASDU.UnmarshalBinary` relies on it (via `fixInfoObjSize()` →
+`GetInfoObjSize()`) to determine how much data to consume for an Information
+Object, so **every** received ASDU of an affected type depends on a table entry:
+
+```go
+// go-iecp5/asdu/identifier.go
+var infoObjSize = map[TypeID]int{
+	...
+	C_SC_NA_1: 1,
+	C_DC_NA_1: 1,
+	C_RC_NA_1: 1,
+	C_SE_NA_1: 3,
+	C_SE_NB_1: 3,
+	C_SE_NC_1: 5,
+	C_BO_NA_1: 4,     // only the UNTAGGED (NA) command variants are registered
+	...
+	C_TS_TA_1: 9,     // the only registered TA-tagged type
+}
+
+func GetInfoObjSize(id TypeID) (int, error) {
+	size, exists := infoObjSize[id]
+	if !exists {
+		return 0, ErrTypeIdentifier // "asdu: type identification unknown"
+	}
+	return size, nil
+}
+```
+
+The library defines the following seven Type IDs, and **none** of them has an
+entry in `infoObjSize`:
+
+| Type ID | Value | Information-object layout | Correct size (octets) |
+| :--- | :--- | :--- | :--- |
+| `C_SC_TA_1` | 58 | SCO (1) + CP56Time2a (7) | 8 |
+| `C_DC_TA_1` | 59 | DCO (1) + CP56Time2a (7) | 8 |
+| `C_RC_TA_1` | 60 | RCO (1) + CP56Time2a (7) | 8 |
+| `C_SE_TA_1` | 61 | NVA (2) + QOS (1) + CP56Time2a (7) | 10 |
+| `C_SE_TB_1` | 62 | SVA (2) + QOS (1) + CP56Time2a (7) | 10 |
+| `C_SE_TC_1` | 63 | R32 (4) + QOS (1) + CP56Time2a (7) | 12 |
+| `C_BO_TA_1` | 64 | 32-bit string (4) + CP56Time2a (7) | 11 |
+
+`C_TS_TA_1` works only because it *is* registered (9 = 2 + 7). Adding the seven
+missing rows is the only change required; the information-object codecs
+(`AppendX`/`DecodeX`, `Get*Cmd()`) already exist and are correct.
+
+### 14.3 Scope: the whole group 58–64, not one type
+
+This is **not** a problem specific to `C_BO_TA_1`. All seven Type IDs 58–64 are
+missing from `infoObjSize`, so the complete time-tagged command group in the
+control direction is affected. These types exist everywhere else in the library
+(constants, `AppendX`/`DecodeX` codecs, `Get*Cmd()` getters, and even
+`client.SendCmd()`'s dispatch) but are absent from the size table.
+
+### 14.4 Why `C_BO_TA_1` fails during `UnmarshalBinary`
+
+`UnmarshalBinary` relies on `GetInfoObjSize()` to determine how much data to
+consume for an Information Object. For `C_BO_TA_1` (Type ID 64) the lookup has no
+entry and therefore returns `ErrTypeIdentifier`, which aborts the decode:
+
+```text
+C_BO_TA_1
+    ↓
+MarshalBinary
+    ↓
+Type-64 binary frame
+    ↓
+UnmarshalBinary
+    ↓
+fixInfoObjSize()
+    ↓
+GetInfoObjSize(64)
+    ↓
+ErrTypeIdentifier
+    ↓
+Round-trip fails
+```
+
+Upstream code path (`go-iecp5/asdu/asdu.go`):
+
+```go
+func (sf *ASDU) UnmarshalBinary(rawAsdu []byte) error {
+	...
+	sf.infoObj = append(sf.bootstrap[lenDUI:lenDUI], rawAsdu[lenDUI:]...)
+	return sf.fixInfoObjSize() // -> GetInfoObjSize(sf.Type)
+}
+
+func (sf *ASDU) fixInfoObjSize() error {
+	objSize, err := GetInfoObjSize(sf.Type)
+	if err != nil {
+		return err
+	}
+	...
+}
+```
+
+### 14.5 Expected behavior
+
+Every `TypeID` defined by the library — including `C_SC_TA_1` … `C_BO_TA_1`
+(Type IDs 58–64) — should have a corresponding `infoObjSize` entry so that its
+frames can be unmarshaled and delivered to the application handler like any other
+type.
+
+### 14.6 Actual behavior
+
+For any Type ID missing from `infoObjSize`, `GetInfoObjSize()` returns
+`ErrTypeIdentifier` ("asdu: type identification unknown"), `fixInfoObjSize()`
+propagates it, and `UnmarshalBinary` fails. The receiver drops the frame inside
+the cs104 read/dispatch loop **before** the application handler is called, and the
+sender is not informed — `Send` returns `nil`:
+
+```text
+cs104 server => [E]: asdu UnmarshalBinary failed,asdu: type identification unknown
+```
+
+The failure is also silent by default: `clog.Clog` starts disabled, so
+`sf.Error()`/`sf.Warn()` print nothing until `LogMode(true)` is called (this
+repository exposes that switch as `-verbose` in both programs).
+
+### 14.7 Version status: upgrading v1.2.5 → v1.2.6 does not resolve it
+
+The defect is present in **both** `go-iecp5 v1.2.5` and `v1.2.6`. `v1.2.6` does
+**not** add the missing entries; the same seven Type IDs (58–64) are still absent
+from `infoObjSize`.
+
+| Check | Result |
+| :--- | :--- |
+| Git tag `v1.2.5` → commit | `2269ee79a5e137847bbdc811be71a1064d303560` |
+| Git tag `v1.2.6` → commit | `2269ee79a5e137847bbdc811be71a1064d303560` (**same commit**) |
+| GitHub `compare/v1.2.5...v1.2.6` | `"status": "identical"`, `total_commits: 0`, `files: []` |
+| `asdu/identifier.go` size | v1.2.5 = 21348 bytes; v1.2.6 = 21348 bytes |
+| `asdu/identifier.go` SHA-256 (v1.2.5, module cache) | `0C6F5043D762E57539841E5A4E344CD460E36311FCC1EDF27936052D2887C6C3` |
+| module proxy `@v/v1.2.6.info` | `Time: 2026-02-03T06:11:18Z`, `Hash: 2269ee79a5e137847bbdc811be71a1064d303560` |
+
+Both tags resolve to the same commit, so the two versions ship an identical
+`infoObjSize` table. Upgrading the dependency from `v1.2.5` to `v1.2.6` therefore
+changes nothing for this defect.
+
+### 14.8 Impact on `C_BO_TA_1` round-trip testing
+
+`C_BO_TA_1` is implemented at the application level in this repository:
+
+* client — `iec104_client/main.go` sends `SendCmd(ca, asdu.C_BO_TA_1, 4000, 0x00FF00FF)`;
+* outstation — `iec104_server/handler.go` (`OnASDU`, case `C_BO_NA_1, C_BO_TA_1`)
+  parses the request with `pack.GetBitsString32Cmd()`;
+* confirmation — `iec104_server/confirm.go` (`confirmBitsString32Cmd`) builds the
+  `ActivationCon` reply and appends the `CP56Time2a` for the `TA` variant.
+
+The Type ID is recognized by the library and handled by the application, but the
+frame is rejected during `UnmarshalBinary` at the receiver, so `C_BO_TA_1` cannot
+complete a real `MarshalBinary → UnmarshalBinary` round-trip against an unmodified
+published `go-iecp5 v1.2.6`.
+
+**The application implementation should therefore not be marked as incomplete or
+incorrect.** The blocker is in the upstream dependency's `infoObjSize` mapping.
+
+Verified A/B evidence (same client session, two frames):
+
+| Frame | Receiver behaviour |
+| :--- | :--- |
+| `C_BO_NA_1` (51, **registered**) | decoded → `[server] bitstring32 command: IOA=4001 value=0x0F0F0F0F COT=COT<Activation>` → client receives the `ActivationCon` confirmation |
+| `C_BO_TA_1` (64, **not registered**) | `[E]: asdu UnmarshalBinary failed,asdu: type identification unknown` → dropped, no handler, no confirmation |
+
+### 14.9 Current workaround / mitigation
+
+There is **no application-level registration workaround**: `infoObjSize` is
+unexported and `go-iecp5` does not expose a registration API for adding
+Information Object sizes (the source comment only says "Type extensions must
+register here"). The drop also happens inside the cs104 read/dispatch loop, before
+any handler runs, so the application cannot intercept it. Mitigations:
+
+1. **Patched copy of the library** — required if `C_BO_TA_1` must pass a real
+   `MarshalBinary → UnmarshalBinary` round-trip. Add the seven rows (58–64) to
+   `infoObjSize` and build against a patched copy, e.g.
+   `replace github.com/wendy512/go-iecp5 => ./third_party/go-iecp5` in both
+   modules, or `go mod vendor` + edit.
+2. **Use the untagged twin `C_BO_NA_1` (51)** — registered and verified working
+   end-to-end in this repository; the demo sends it alongside `C_BO_TA_1`.
+3. **A custom `asdu.Params`/type ID is not an option**: the type byte on the wire
+   must be 64 for a `C_BO_TA_1`, and the receiver validates it by that byte.
+
+This repository keeps the complete `C_BO_TA_1` code path in place
+(`confirmBitsString32Cmd`, the `OnASDU` case, the demo command), so the moment the
+size table is patched the round-trip completes without any change here.
+
+### 14.10 Reproduction / verification
+
+All checks are read-only against the published source:
+
+```powershell
+# both tags resolve to the same commit
+curl.exe -s https://api.github.com/repos/wendy512/go-iecp5/git/refs/tags/v1.2.5
+curl.exe -s https://api.github.com/repos/wendy512/go-iecp5/git/refs/tags/v1.2.6
+
+# "status": "identical", "total_commits": 0, "files": []
+curl.exe -s "https://api.github.com/repos/wendy512/go-iecp5/compare/v1.2.5...v1.2.6"
+
+# module metadata for v1.2.6 (same commit hash, same code)
+curl.exe -s https://proxy.golang.org/github.com/wendy512/go-iecp5/@v/v1.2.6.info
+```
+
+On the wire, enable `-verbose` in either program to surface the otherwise silent
+drop:
+
+```text
+cs104 server => [E]: asdu UnmarshalBinary failed,asdu: type identification unknown
+```
+
+### 14.11 Scope note
+
+This section documents a defect in the upstream `go-iecp5` dependency as observed
+against the published `v1.2.5`/`v1.2.6` code in this repository. It describes only
+observable behavior of the library and makes no claims about the upstream
+author's intent.

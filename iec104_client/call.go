@@ -90,8 +90,8 @@ func (m *masterCall) OnASDU(packet *asdu.ASDU) error {
 		}
 	case client.MeasuredValueFloat:
 		for _, p := range packet.GetMeasuredValueFloat() {
-			fmt.Printf("[client] measured float: IOA=%d value=%.3f QDS=%d COT=%v time=%s\n",
-				p.Ioa, p.Value, p.Qds, packet.Coa, p.Time.Format(time.RFC3339Nano))
+			fmt.Printf("[client] measured float: IOA=%d value=%.3f QDS=%d COT=%v type=%v time=%s\n",
+				p.Ioa, p.Value, p.Qds, packet.Coa, packet.Type, p.Time.Format(time.RFC3339Nano))
 		}
 	case client.IntegratedTotals:
 		for _, p := range packet.GetIntegratedTotals() {
@@ -108,6 +108,8 @@ func (m *masterCall) OnASDU(packet *asdu.ASDU) error {
 
 // onCommandReply parses control command confirmations echoed by the server.
 // It returns true when the frame was a command confirmation.
+// (C_BO_NA_1 / C_BO_TA_1 confirmations carry a 32-bit bitstring value plus,
+// for the TA variant, a CP56Time2a echo.)
 func (m *masterCall) onCommandReply(packet *asdu.ASDU) bool {
 	switch packet.Type {
 	case asdu.C_TS_TA_1:
@@ -139,6 +141,11 @@ func (m *masterCall) onCommandReply(packet *asdu.ASDU) bool {
 		sp := packet.GetSetpointFloatCmd()
 		fmt.Printf("[client] setpoint float confirmation: IOA=%d value=%.3f COT=%v\n",
 			sp.Ioa, sp.Value, packet.Coa)
+		return true
+	case asdu.C_BO_NA_1, asdu.C_BO_TA_1:
+		bc := packet.GetBitsString32Cmd()
+		fmt.Printf("[client] bitstring32 command confirmation: IOA=%d value=0x%08X COT=%v time=%s\n",
+			bc.Ioa, bc.Value, packet.Coa, bc.Time.UTC().Format(time.RFC3339))
 		return true
 	default:
 		return false

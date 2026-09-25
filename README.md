@@ -35,7 +35,8 @@ cd iec104_client; go build ./...
 ```
 
 Flags: `-host`, `-port`, `-ca` (common address, default 1),
-server: `-period`/`-spontaneous` (reporting intervals), `-duration`.
+server: `-period`/`-spontaneous` (reporting intervals), `-duration`,
+both: `-verbose` (enable the go-iecp5 frame/decode log, off by default).
 
 ## Protocol exchanges exercised
 
@@ -49,11 +50,15 @@ server: `-period`/`-spontaneous` (reporting intervals), `-duration`.
 | Reset process | `C_RP_NA_1` | Activation (6) | ActivationCon (7) |
 | Delay acquisition | `C_CD_NA_1` | Activation (6) | ActivationCon (7) |
 | Single / Double / Set-point | `C_SC_NA_1` / `C_DC_NA_1` / `C_SE_*_1` | Activation (6) | ActivationCon (7) |
+| Bitstring-32 (untagged) | `C_BO_NA_1` | Activation (6) | ActivationCon (7) |
+| Bitstring-32 + CP56Time2a | `C_BO_TA_1` | Activation (6) | ActivationCon (7) — frame dropped by the unpatched library, see §14 of the bug report |
 | Periodic data | `M_ME_NC_1` | Periodic (1) | — |
-| Spontaneous data | `M_SP_TB_1` | Spontaneous (3) | — |
+| Spontaneous data | `M_SP_TB_1` + `M_ME_TF_1` (CP56-tagged) | Spontaneous (3) | — |
 
 Monitoring data sent in the interrogation response: `M_SP_NA_1`, `M_DP_NA_1`,
-`M_ME_NA_1`, `M_ME_NC_1` (COT 20); counters `M_IT_NA_1` (COT 37).
+`M_ME_NA_1`, `M_ME_NC_1`, `M_ME_TF_1` (COT 20); counters `M_IT_NA_1` (COT 37).
+Background reporting: `M_ME_NC_1` IOA 301 (COT 1) every `-period`, plus
+`M_SP_TB_1` IOA 100 and `M_ME_TF_1` IOA 302 (COT 3) every `-spontaneous`.
 
 ## Key implementation point (the workaround)
 
@@ -71,3 +76,19 @@ This is implemented in `iec104_server/confirm.go`. It also sidesteps the fact
 that the library's command constructors (`InterrogationCmd`,
 `ClockSynchronizationCmd`, ...) *force* `Activation` and therefore cannot
 produce `ActivationCon` confirmations.
+
+The same rule drives `sendMeasuredFloatTime` (hand-built `M_ME_TF_1`):
+`asdu.MeasuredValueFloatCP56Time2a` accepts only COT Spontaneous/Request, and
+`asdu.BitsString32Cmd` only `Activation`/`Deactivation`, so both confirmations
+and the GI-time-tagged measurement are assembled by hand.
+
+## Known limitation — `C_BO_TA_1` (bug report §14)
+
+`go-iecp5`'s `asdu.infoObjSize` table has **no entry** for `C_BO_TA_1` (nor for
+`C_SC_TA_1`, `C_DC_TA_1`, `C_RC_TA_1`, `C_SE_TA_1/TB_1/TC_1`), so a receiver drops
+such frames inside `UnmarshalBinary` (`asdu: type identification unknown`) before
+any handler runs, and the sender gets no error. The failure is silent unless
+`-verbose` is used. The complete `C_BO_TA_1` code path is implemented and ready;
+because the table is unexported and there is no registration API, only a patched
+library makes the round-trip work — until then the demo also sends the
+registered, working `C_BO_NA_1`.

@@ -19,12 +19,18 @@ func main() {
 	port := flag.Int("port", 2404, "server port")
 	ca := flag.Uint("ca", 1, "ASDU common address")
 	duration := flag.Duration("duration", 30*time.Second, "how long to run (0 = until Ctrl+C)")
+	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors)")
 	flag.Parse()
 
 	settings := client.NewSettings()
 	settings.Host = *host
 	settings.Port = *port
 	settings.AutoConnect = true
+	if *verbose {
+		// See iec_60870_5_104_bug_report.md "Bug 3": the client swallows ASDU
+		// decode errors (sf.Warn) unless this is enabled.
+		settings.LogCfg = &client.LogCfg{Enable: true}
+	}
 
 	c := client.New(settings, &masterCall{})
 	c.SetOnConnectHandler(func(_ *client.Client) {
@@ -84,6 +90,17 @@ func sendDemoCommands(c *client.Client, ca uint16) {
 		}},
 		{"setpoint float", func() error {
 			return c.SendCmd(ca, asdu.C_SE_NC_1, asdu.InfoObjAddr(3000), float32(125.5))
+		}},
+		{"bitstring command", func() error {
+			return c.SendCmd(ca, asdu.C_BO_TA_1, asdu.InfoObjAddr(4000), uint32(0x00FF00FF))
+		}},
+		// C_BO_NA_1 (51) is the untagged twin of C_BO_TA_1 (64) and is the one
+		// that survives the peer's decoder: go-iecp5's infoObjSize table has no
+		// entry for C_BO_TA_1, so the peer drops that frame during
+		// UnmarshalBinary ("type identification unknown") before any handler
+		// runs - see iec_60870_5_104_bug_report.md "Bug 3".
+		{"bitstring command (untagged twin of C_BO_TA_1)", func() error {
+			return c.SendCmd(ca, asdu.C_BO_NA_1, asdu.InfoObjAddr(4001), uint32(0x0F0F0F0F))
 		}},
 	}
 	for _, cmd := range cmds {
