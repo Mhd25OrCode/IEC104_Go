@@ -213,12 +213,18 @@ spontaneousLoop : every -spontaneous → M_SP_TB_1  IOA 100  COT=Spontaneous(3) 
 spontaneousLoop : every -spontaneous → M_ME_TF_1  IOA 302  COT=Spontaneous(3)  analog (CP56-tagged)
 ```
 
+IOA 302 repeats the analog value the periodic loop last reported (the spontaneous
+loop only reads the process image), and IOA 301 wraps to -30 as soon as
+`value += 12.5` would exceed 220 — so negative values in a longer run are expected,
+not a fault (40 s run on 2026-09-25: 13 periodic + 19/19 spontaneous frames,
+100.000 → 212.500 → -30.000, see `iec_60870_5_104_bug_report.md` §15).
+
 ### 2.4 Build & run
 
 ```powershell
-# build both
-cd iec104_server; go build ./...
-cd iec104_client; go build ./...
+# build both — run each module's build from inside that module's folder
+cd iec104_server; go build ./...      # writes .\iec104_server\iec104-server.exe
+cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 
 # terminal 1 — outstation (runs until Ctrl+C, or pass -duration)
 .\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
@@ -230,6 +236,16 @@ cd iec104_client; go build ./...
 # that is how the silent C_BO_TA_1 drop (Bug 3, §4) becomes visible
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s -verbose
 ```
+
+The two binaries are named after the module paths
+(`github.com/alfas/iec104-server` / `-client`), not after the folder names
+(`iec104_server` / `iec104_client`), which is why `go build ./...` inside each
+folder yields exactly the names used above. A plain `cd iec104_client` after the
+first command fails — it is relative to `iec104_server` — so use
+`cd ..\iec104_client` as shown. When capturing a run to files, redirect with
+`Start-Process -RedirectStandardOutput/-RedirectStandardError` (or `cmd /c ... 1> x
+2> y`); PowerShell 5.1's `2>` wraps the native client's stderr in a
+`NativeCommandError` record and writes UTF-16.
 
 ## 3. ASDUs used
 
@@ -359,7 +375,10 @@ The error is invisible by default: `clog` starts disabled, and
 `C_BO_NA_1` (registered) is decoded → `[server] bitstring32 command: IOA=4001
 value=0x0F0F0F0F` → `ActivationCon` confirmation received, while `C_BO_TA_1`
 (not registered) produces the log line above and no handler call. The sender
-never sees an error. `infoObjSize` is unexported and there is no registration
+never sees an error. Re-verified on 2026-09-25 with the same A/B in one session
+(`logs/srv9.out` vs. `logs/srv8.out`; a run without `-verbose` shows no trace of
+the dropped frame at all) — see `iec_60870_5_104_bug_report.md` §15.
+`infoObjSize` is unexported and there is no registration
 API, so there is **no application-level workaround** — only a patched library
 (or the untagged `C_BO_NA_1`, which this repo uses by default) makes
 `C_BO_TA_1` complete a round-trip. See the bug report §14.
