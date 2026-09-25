@@ -166,15 +166,115 @@ The same rule drives `sendMeasuredFloatTime` (hand-built `M_ME_TF_1`):
 `asdu.BitsString32Cmd` only `Activation`/`Deactivation`, so both confirmations
 and the GI-time-tagged measurement are assembled by hand.
 
+## Library bugs and how they are handled
+
+Three defects were found in the dependency stack while building this system
+(`wendy512/iec104` v1.0.4 + `wendy512/go-iecp5` v1.2.5/v1.2.6). The full
+verification — reproduction steps, A/B evidence and upstream commit hashes — is in
+`iec_60870_5_104_bug_report.md`; the summary is repeated here because these bugs
+directly shape the code in `iec104_server/`.
+
+| # | Bug | Fails on | Responsible side | Status in this repo |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | `SendReplyMirror()` after `Get*Cmd()` builds the reply from an already-consumed ASDU | the peer that *decodes the command and replies* | **server / outstation** | ✅ Resolved (workaround in `confirm.go`) |
+| 2 | General interrogation never produced `ActivationCon` → data → `ActivationTerm` | the peer that *answers the interrogation* | **server / outstation** | ✅ Resolved (`station.OnInterrogation`) |
+| 3 | `asdu.infoObjSize` has no entry for `C_SC_TA_1` … `C_BO_TA_1` (Type IDs 58–64) | any peer that *receives* one of those types | **upstream `go-iecp5`** (neither app side) | ⚠ Open — untagged `C_BO_NA_1` used instead |
+
+### Bug 1 — `Get*Cmd()` + `SendReplyMirror()`
+
+`GetSingleCmd()`, `GetInterrogationCmd()`, `GetCounterInterrogationCmd()`,
+`GetReadCmd()`, `GetResetProcessCmd()` and `GetDelayAcquireCommand()` are not
+side-effect-free getters: they **consume / advance the ASDU's internal
+information-object buffer**. cs104's server dispatcher calls them *before* the
+application handler runs, so a `pack.SendReplyMirror(...)` issued in the handler is
+assembled from already-drained data and arrives empty or truncated. The peer then
+reports:
+
+```text
+asdu UnmarshalBinary failed, EOF
+```
+
+It is not enough to avoid calling the getter yourself: the dispatcher may already
+have called it, and cs104 *also* answers a non-nil handler error with
+`SendReplyMirror(UnknownTypeID)` on its own. **The defect therefore belongs to the
+replying (server / outstation) side; the client is only the victim that prints the
+error.**
+
+Fix used here (`iec104_server/confirm.go`): treat every ASDU as consumed after a
+`Get*Cmd()`, use it only to *read* parameters, and build a **brand-new ASDU**
+(`asdu.NewASDU` + `AppendInfoObjAddr` + `Append*`) with `Cause = ActivationCon`.
+`handler.go` additionally routes handler errors through `replyOrLog()` so the
+library cannot emit its own mirrored reply. See "Key implementation point" above
+and bug report §2–§4 / §13.
+
+### Bug 2 — General interrogation sequence
+
+With the library's bundled example the client sent `C_IC_NA_1` and the server
+received it, but the standard three-step sequence
+
+```text
+client: C_IC_NA_1  COT=Activation(6)     QOI=20
+server: C_IC_NA_1  COT=ActivationCon(7)  QOI=20
+server: M_*        COT=InterrogatedByStation(20)
+server: C_IC_NA_1  COT=ActivationTerm(10) QOI=20
+```
+
+was never observed. The interrogating **master is not at fault** — it only sends the
+activation; the answering **outstation** owns the confirmation and the termination,
+so this is a server-side defect (an application/example defect, distinct from
+Bug 1 and not fixed by Bug 1's workaround alone).
+
+Fix used here: `station.OnInterrogation` hand-builds the whole sequence —
+`confirmInterrogation(..., ActivationCon, ...)` → `sendAllData(...)` with
+`COT=InterrogatedByStation(20)` → `confirmInterrogation(..., ActivationTerm, ...)`.
+A `Deactivation(8)` request is answered with `DeactivationCon(9)`. Verified
+end-to-end on 2026-09-25 (see the run section above). Bug report §6 / §7 / §13.
+
+### Bug 3 — `infoObjSize` has no entry for Type IDs 58–64
+
+`go-iecp5`'s `asdu/identifier.go` defines the time-tagged command group
+`C_SC_TA_1`, `C_DC_TA_1`, `C_RC_TA_1`, `C_SE_TA_1`, `C_SE_TB_1`, `C_SE_TC_1`,
+`C_BO_TA_1` (Type IDs 58–64) but registers **none** of them in the unexported
+`infoObjSize` map. `ASDU.UnmarshalBinary` → `fixInfoObjSize()` → `GetInfoObjSize()`
+therefore returns `ErrTypeIdentifier`, and the frame is **dropped inside cs104's
+read loop before any handler runs**, with no error at the sender (`Send` returns
+`nil`). The drop is also silent by default — only `-verbose` (`LogMode(true)`)
+surfaces it:
+
+```text
+cs104 server => [E]: asdu UnmarshalBinary failed,asdu: type identification unknown
+```
+
+**Responsibility: the upstream library (`wendy512/go-iecp5`), not either
+application side.** The defect is present in both v1.2.5 and v1.2.6 (identical
+commit `2269ee7`) and is direction-agnostic: it hits whichever peer *receives*
+those types. In this demo that is the **server**, which drops the client's
+`C_BO_TA_1` while the registered untagged twin `C_BO_NA_1` (51) completes its
+round-trip in the same session.
+
+Because `infoObjSize` is unexported and there is no registration API, **there is no
+application-level fix**: only a patched/vendored library (adding the seven rows) or
+the untagged `C_BO_NA_1` works. This repository keeps the complete `C_BO_TA_1`
+code path in place and sends the working `C_BO_NA_1` alongside it — see the next
+section and bug report §14.
+
 ## Known limitation — `C_BO_TA_1` (bug report §14)
 
-`go-iecp5`'s `asdu.infoObjSize` table has **no entry** for `C_BO_TA_1` (nor for
-`C_SC_TA_1`, `C_DC_TA_1`, `C_RC_TA_1`, `C_SE_TA_1/TB_1/TC_1`), so a receiver drops
-such frames inside `UnmarshalBinary` (`asdu: type identification unknown`) before
-any handler runs, and the sender gets no error. The failure is silent unless
-`-verbose` is used. Re-verified on 2026-09-25 (see the run section above): the
-type-64 frame is still dropped while the type-51 twin completes its round-trip.
-The complete `C_BO_TA_1` code path is implemented and ready;
-because the table is unexported and there is no registration API, only a patched
-library makes the round-trip work — until then the demo also sends the
-registered, working `C_BO_NA_1`.
+Bug 3 above means `C_BO_TA_1` cannot complete a `MarshalBinary → UnmarshalBinary`
+round-trip against an unmodified published `go-iecp5`. The application code here is
+complete; only the codec table is missing. Options:
+
+1. **Patch / vendor the library** — add the seven `infoObjSize` rows (58–64) and
+   build against a patched copy, e.g. `replace github.com/wendy512/go-iecp5 =>
+   ./third_party/go-iecp5` in both modules, or `go mod vendor` + edit. This is the
+   only way to make `C_BO_TA_1` round-trip.
+2. **Use the untagged twin `C_BO_NA_1` (51)** — registered and verified working
+   end-to-end; the demo sends it alongside `C_BO_TA_1` (IOA 4001 vs. IOA 4000).
+3. **A custom type ID is not an option** — the type byte on the wire must be 64 for
+   a `C_BO_TA_1`, and the receiver validates it by that byte.
+
+Re-verified on 2026-09-25 (see the run section above): the type-64 frame is still
+dropped while the type-51 twin completes its round-trip. The complete `C_BO_TA_1`
+code path stays in place (`confirmBitsString32Cmd`, the `OnASDU` case, the demo
+command), so patching the size table is the only change needed once upstream fixes
+its decoder.
