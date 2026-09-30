@@ -20,6 +20,8 @@ func main() {
 	ca := flag.Uint("ca", 1, "ASDU common address")
 	duration := flag.Duration("duration", 30*time.Second, "how long to run (0 = until Ctrl+C)")
 	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors)")
+	grpcSocket := flag.String("grpc-socket", "iec104-bridge.sock", "Unix Domain Socket path for the Iec104Bridge gRPC server (NestJS default: /run/msl5/iec104-bridge.sock)")
+	demo := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active, instead of waiting for gRPC Dispatch calls")
 	flag.Parse()
 
 	settings := client.NewSettings()
@@ -32,16 +34,26 @@ func main() {
 		settings.LogCfg = &client.LogCfg{Enable: true}
 	}
 
-	c := client.New(settings, &masterCall{})
+	bridge := newBridgeServer(nil) // client wired in below, once c exists
+	c := client.New(settings, &masterCall{bridge: bridge})
+	bridge.client = c
 	c.SetOnConnectHandler(func(_ *client.Client) {
 		fmt.Println("[client] connected to outstation")
 	})
 
 	// The master traffic starts once the outstation has confirmed STARTDT.
 	c.SetServerActiveHandler(func(c *client.Client) {
-		fmt.Println("[client] outstation active (STARTDT confirmed) - sending demo commands")
-		sendDemoCommands(c, uint16(*ca))
+		fmt.Println("[client] outstation active (STARTDT confirmed)")
+		if *demo {
+			fmt.Println("[client] -demo set - sending demo commands")
+			sendDemoCommands(c, uint16(*ca))
+		}
 	})
+
+	grpcServer, err := startGRPCServer(*grpcSocket, bridge)
+	if err != nil {
+		log.Fatalf("grpc server: %v", err)
+	}
 
 	if err := c.Connect(); err != nil {
 		log.Fatalf("connect failed: %v", err)
@@ -64,6 +76,7 @@ func main() {
 	}
 	<-ctx.Done()
 
+	grpcServer.GracefulStop()
 	if err := c.Close(); err != nil {
 		log.Printf("close: %v", err)
 	}

@@ -3,3 +3,9 @@
 
 # local test logs
 logs/
+
+# downloaded protoc binary used only for local codegen
+iec104_client/tools/
+
+# gRPC bridge unix socket
+iec104_client/*.sock
