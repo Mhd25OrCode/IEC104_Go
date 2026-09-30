@@ -18,22 +18,33 @@ Documentation for the IEC 104 master + outstation test system in this repository
 Two cooperating programs exchange IEC 104 frames over one TCP connection:
 
 ```text
-┌──────────────────────────┐      TCP 2404 (IEC 104)       ┌──────────────────────────┐
-│  iec104_client  (master) │ ◄───────────────────────────► │ iec104_server (outstation)│
-│                          │  commands (C_*)               │                          │
-│  main.go                 │  ───────────────────────────► │ main.go                  │
-│   flags, connect, demo   │                               │  flags, listener,        │
-│   command sequence       │  confirmations & data         │  lifecycle               │
-│                          │  (M_*, ActivationCon/Term)    │                          │
-│  call.go                 │  ◄─────────────────────────── │ handler.go               │
-│   client.ASDUCall impl:  │                               │  server.CommandHandler:  │
-│   all inbound callbacks  │                               │  process image, GI / CI, │
-│                          │                               │  periodic + spontaneous  │
-│                          │                               │ confirm.go               │
-│                          │                               │  fresh-ASDU confirmation │
-│                          │                               │  builders (bug workaround)│
-└──────────────────────────┘                               └──────────────────────────┘
+                       gRPC (Iec104Bridge)            ┌──────────────────────────┐      TCP 2404 (IEC 104)       ┌──────────────────────────┐
+                       Unix Domain Socket              │  iec104_client  (master) │ ◄───────────────────────────► │ iec104_server (outstation)│
+   NestJS backend  ◄──────────────────────────────────►│                          │  commands (C_*)               │                          │
+   (external, not   Dispatch(points) →                 │  main.go                 │  ───────────────────────────► │ main.go                  │
+   in this repo)    ← stream Iec104Point (events)       │   flags, connect,        │                               │  flags, listener,        │
+                                                        │   -demo command seq.     │  confirmations & data         │  lifecycle               │
+                                                        │                          │  (M_*, ActivationCon/Term)    │                          │
+                                                        │  call.go                 │  ◄─────────────────────────── │ handler.go               │
+                                                        │   client.ASDUCall impl:  │                               │  server.CommandHandler:  │
+                                                        │   all inbound callbacks  │                               │  process image, GI / CI, │
+                                                        │   → bridge.publishEvent  │                               │  periodic + spontaneous  │
+                                                        │                          │                               │ confirm.go               │
+                                                        │  grpcserver.go           │                               │  fresh-ASDU confirmation │
+                                                        │   bridgeServer, registry,│                               │  builders (bug workaround)│
+                                                        │   eventHub (pub/sub)     │                               │                          │
+                                                        │  typemap.go              │                               │                          │
+                                                        │   asdu_typ <-> TypeID    │                               │                          │
+                                                        └──────────────────────────┘                               └──────────────────────────┘
 ```
+
+The gRPC layer is an optional adapter bolted onto the existing master: it lets
+an external process (NestJS) drive the same `*client.Client` that the built-in
+`-demo` command sequence uses, and observe every inbound ASDU as a stream of
+`Iec104Point` messages. Full detail (proto contract, `typemap.go`,
+`grpcserver.go` internals) lives in
+[`iec104_client_architecture.md`](iec104_client_architecture.md) §7; this
+document only covers how it fits into the whole system.
 
 ### 1.2 Repository layout
 
@@ -42,8 +53,12 @@ Two cooperating programs exchange IEC 104 frames over one TCP connection:
 | `iec104_server/main.go` | Flags (`-host`, `-port`, `-ca`, `-period`, `-spontaneous`, `-duration`), listener lifecycle, graceful shutdown on `-duration` or Ctrl+C/SIGTERM |
 | `iec104_server/handler.go` | `station` — implements `server.CommandHandler`: process image, general/counter interrogation, read/clock-sync/reset/delay/test handlers, control-command dispatch, background reporting goroutines |
 | `iec104_server/confirm.go` | Confirmation builders that construct **fresh ASDUs** — the `SendReplyMirror()` bug workaround (see §4) |
-| `iec104_client/main.go` | Flags (`-host`, `-port`, `-ca`, `-duration`), connection settings (`AutoConnect`), demo command sequence fired after STARTDT |
-| `iec104_client/call.go` | `masterCall` — implements `client.ASDUCall`: logs every reply, confirmation and monitoring value |
+| `iec104_client/main.go` | Flags (`-host`, `-port`, `-ca`, `-duration`, `-grpc-socket`, `-demo`), connection settings (`AutoConnect`), starts the gRPC bridge server, optional demo command sequence fired after STARTDT (only with `-demo`) |
+| `iec104_client/call.go` | `masterCall` — implements `client.ASDUCall`: logs every reply, confirmation and monitoring value, and forwards each one to `bridge.publishEvent` |
+| `iec104_client/grpcserver.go` | `bridgeServer` — implements the generated `pb.Iec104BridgeServer` (`Dispatch`, `SubscribeEvents`) over a Unix Domain Socket; `registry` correlates `(CommonAddr, InfoObjAddr)` to the last dispatched point; `eventHub` is a non-blocking pub/sub fan-out |
+| `iec104_client/typemap.go` | `asdu_typ` string ↔ `asdu.TypeID` conversion tables, plus `commandValueFromPayload` (decodes `payload_json` into the Go type `SendCmd` expects) |
+| `iec104_client/proto/iec104.proto` | Source of the `Iec104Bridge` gRPC contract (`Iec104Point`, `DispatchRequest`/`DispatchAck`, `SubscribeEvents`) |
+| `iec104_client/pb/*.go` | Generated protobuf/gRPC code from `proto/iec104.proto` (committed; regenerated with `protoc`, see §5) |
 
 ### 1.3 Layering
 
@@ -130,6 +145,10 @@ AppendFloat32 / AppendCP56Time2a / AppendCP16Time2a` — never
 | `OnClockSync`, `OnResetProcess`, `OnDelayAcquisition` | respective confirmations |
 | `OnASDU` | everything else: monitoring data (single / double / measured-normal / measured-float — including the CP56-tagged `M_ME_TF_1`, logged with its type id — / integrated totals) and command confirmations via `onCommandReply` (`C_TS_TA_1`, `C_SC_*`, `C_DC_*`, `C_SE_*`, `C_BO_*`) |
 
+Every one of these callbacks also calls `m.bridge.publishEvent(ca, ioa, typeId,
+cot, value)` (nil-safe, so it's a no-op when no gRPC layer is wired up) —
+see §5 for what that feeds.
+
 ---
 
 ## 2. Workflow
@@ -144,7 +163,8 @@ client: Connect()  (AutoConnect = true)
    ├─ U-format STARTDT / STARTDT_con    (handled inside wendy512/iec104)
    ▼
 client SetServerActiveHandler fires: "outstation active"
-   └─ sendDemoCommands()  — see §2.2
+   └─ -demo set?  → sendDemoCommands()  — see §2.2
+      otherwise  → wait for gRPC Dispatch() calls from the NestJS backend — see §5
    │
    ├─ server background reporting running (see §2.3)
    ▼
@@ -155,7 +175,9 @@ client Close()  /  server Stop()
 
 ### 2.2 Demo command sequence (client → server)
 
-Fired once STARTDT is confirmed, in this order:
+Opt-in via the `-demo` flag (default off); with `-demo` unset the client instead
+waits idle for gRPC `Dispatch` calls (§5). When enabled, fired once STARTDT is
+confirmed, in this order:
 
 | # | Command | Client call | Target |
 | :-- | :-- | :-- | :-- |
@@ -229,8 +251,15 @@ cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 # terminal 1 — outstation (runs until Ctrl+C, or pass -duration)
 .\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
 
-# terminal 2 — master
+# terminal 2 — master (idles and waits for gRPC Dispatch calls by default)
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s
+
+# -demo reinstates the old always-on command sequence (§2.2), useful without a
+# gRPC caller attached
+.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s -demo
+
+# -grpc-socket overrides the Unix Domain Socket path (default iec104-bridge.sock)
+.\iec104_client\iec104-client.exe -grpc-socket /run/msl5/iec104-bridge.sock
 
 # add -verbose to either program to print the raw cs104 frame/decode log;
 # that is how the silent C_BO_TA_1 drop (Bug 3, §4) becomes visible
@@ -386,6 +415,50 @@ API, so there is **no application-level workaround** — only a patched library
 See `iec_60870_5_104_bug_report.md` for the full analysis, the list of
 verified-working functions, and the updated status table.
 
+## 5. gRPC bridge (`Iec104Bridge`)
+
+`iec104_client` additionally exposes the master as a gRPC service so an
+external process (the MSL5 NestJS backend) can drive it instead of — or in
+addition to — the built-in `-demo` sequence. The contract lives in
+`iec104_client/proto/iec104.proto` and is served over a **Unix Domain Socket**
+(default path `iec104-bridge.sock`, overridable with `-grpc-socket`), not TCP.
+
+```text
+service Iec104Bridge {
+  rpc Dispatch(DispatchRequest) returns (DispatchAck);        // backend → client
+  rpc SubscribeEvents(SubscribeRequest) returns (stream Iec104Point); // client → backend
+}
+```
+
+`Iec104Point` is a flat superset message mirroring the backend's `iec104`
+table: it carries an opaque `id`/`designation`/`channel_id` the backend uses to
+correlate frames, the wire-format `asdu_typ` mnemonic (e.g. `"C_SC_NA_1"`), the
+Common Address and Information Object Address split into big-endian bytes
+(`asdu_high/asdu_low`, `ioa_high/ioa_middle/ioa_low` — IEC 104's 3-octet IOA has
+no single Go integer equivalent, hence the split), and a `payload_json` string
+for the command value / decoded measurement.
+
+**Outbound (`Dispatch`):** for each `Iec104Point` in the request,
+`bridgeServer.dispatchPoint` resolves `asdu_typ` to an `asdu.TypeID`
+(`typemap.go`), reassembles CA/IOA from the byte fields, registers the point
+under `(CA, IOA)` for later correlation, and issues the matching `Send*Cmd` /
+`SendCmd` call on the shared `*client.Client` — the same client the `-demo`
+path uses. Per-point errors are collected and returned in one `DispatchAck`
+instead of failing the whole batch.
+
+**Inbound (`SubscribeEvents`):** every `masterCall` callback (§1.6) calls
+`bridge.publishEvent(ca, ioa, typeId, cot, value)`, which builds an
+`Iec104Point` (looking up the registered `id`/metadata for that `(CA, IOA)` if
+one was dispatched earlier) and fans it out to every subscribed stream via a
+non-blocking `eventHub`. Non-blocking is required because `masterCall`'s
+callbacks all run on the underlying library's single `handlerLoop` goroutine
+(see `iec104_client_architecture.md` §2.3) — a slow gRPC subscriber must never
+stall IEC 104 protocol processing; a full per-subscriber channel drops the
+frame and logs a warning instead of blocking.
+
+See [`iec104_client_architecture.md`](iec104_client_architecture.md) §7 for the
+full file-by-file breakdown (`grpcserver.go`, `typemap.go`, code generation
+command, concurrency notes).
 
 
 

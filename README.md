@@ -16,9 +16,16 @@ iec104_server/   outstation ("slave")
   handler.go     CommandHandler + process image + periodic/spontaneous reporting
   confirm.go     fresh-ASDU confirmation builders (the bug workaround)
 iec104_client/   master ("client")
-  main.go        connection + demo command sequence
-  call.go        ASDUCall implementation (all replies & data)
+  main.go        connection lifecycle, starts the gRPC bridge server, optional -demo command sequence
+  call.go        ASDUCall implementation (all replies & data), forwards every event to the gRPC bridge
+  grpcserver.go  Iec104Bridge gRPC service (Dispatch / SubscribeEvents) over a Unix Domain Socket
+  typemap.go     asdu_typ <-> asdu.TypeID conversion for the gRPC contract
+  proto/         Iec104Bridge .proto contract; pb/ holds the generated code
 ```
+
+See [`docs/architecture.md`](docs/architecture.md) and
+[`docs/iec104_client_architecture.md`](docs/iec104_client_architecture.md) §7
+for the full gRPC bridge design.
 
 ## Build & run
 
@@ -30,7 +37,8 @@ cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 # terminal 1 - outstation (runs until Ctrl+C, or pass -duration)
 .\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
 
-# terminal 2 - master (runs until Ctrl+C, or pass -duration)
+# terminal 2 - master (idles waiting for gRPC Dispatch calls by default; add -demo to
+# reinstate the old always-on command sequence)
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s
 ```
 
@@ -56,6 +64,10 @@ $srv.WaitForExit()
 Flags: `-host`, `-port`, `-ca` (common address, default 1),
 server: `-period`/`-spontaneous` (reporting intervals), `-duration`,
 both: `-verbose` (enable the go-iecp5 frame/decode log, off by default).
+Client only: `-demo` (send the built-in demo command sequence instead of
+waiting for gRPC `Dispatch` calls, off by default), `-grpc-socket` (Unix
+Domain Socket path for the `Iec104Bridge` gRPC server, default
+`iec104-bridge.sock`).
 
 ## Protocol exchanges exercised
 
