@@ -72,6 +72,90 @@ the `-grpc-socket` path is ignored when it is set), `-grpc-socket` (Unix
 Domain Socket path for the `Iec104Bridge` gRPC server, default
 `iec104-bridge.sock`).
 
+## Raspberry Pi CM5 (Debian trixie, arm64) build & deploy
+
+The deployment target is a Raspberry Pi Compute Module 5 running
+**Debian GNU/Linux 13 (trixie), 64-bit arm64**, with systemd. Both programs run
+on the CM5: the outstation on `0.0.0.0:2404` and the master (with its
+`Iec104Bridge` gRPC server) connecting to it over loopback and exposing the
+socket at `/run/msl5/iec104-bridge.sock`.
+
+### Prerequisites
+
+Go **1.27.1** (the version pinned in both `go.mod` files) must be available.
+Debian 13 ships Go 1.24, which is too old, so either:
+
+```bash
+# option A - official arm64 toolchain (recommended)
+#   download from https://go.dev/dl/ and unpack to /usr/local/go
+export PATH=/usr/local/go/bin:$PATH
+go version    # go1.27.1 linux/arm64
+```
+
+```bash
+# option B - keep Debian's Go and let it fetch the pinned toolchain on first
+# build (GOTOOLCHAIN=auto is the default since Go 1.21; needs internet)
+```
+
+### Build
+
+```bash
+./build.sh
+```
+
+Builds static arm64 ELF binaries (CGO disabled, no runtime deps) into `dist/`:
+
+```text
+dist/iec104-server
+dist/iec104-client
+```
+
+`file dist/iec104-server` should report `ELF 64-bit LSB executable, ARM aarch64`.
+The same script works as a cross-build from Windows/WSL when a Go 1.27.1
+toolchain is present.
+
+> If the scripts lost their executable bit (e.g. copied from Windows or a ZIP),
+> run `chmod +x build.sh deploy/*.sh` first.
+
+### Install as systemd services
+
+```bash
+sudo ./deploy/install.sh
+```
+
+The installer creates an `iec104` system user, copies the binaries to
+`/opt/iec104/`, installs `deploy/iec104-server.service` and
+`deploy/iec104-client.service` into `/etc/systemd/system/`, then runs
+`daemon-reload` and `enable --now` on both.
+
+```bash
+systemctl status iec104-server iec104-client
+journalctl -u iec104-server -u iec104-client -f
+```
+
+The client unit sets `RuntimeDirectory=msl5`, so systemd creates and owns
+`/run/msl5/` (and removes it on stop) for the gRPC socket. If the NestJS backend
+runs as a different user, add its group via `SupplementaryGroups=` (and/or relax
+the socket `UMask`) in `deploy/iec104-client.service`; both lines are present,
+commented out. Port 2404 is unprivileged, so the services run as the non-root
+`iec104` user.
+
+### Smoke test (binaries directly, no systemd)
+
+```bash
+./dist/iec104-server -host 0.0.0.0 -port 2404 -duration 20s &
+./dist/iec104-client -host 127.0.0.1 -port 2404 -demo -duration 15s
+```
+
+### Uninstall
+
+```bash
+sudo ./deploy/uninstall.sh
+```
+
+Stops and disables both units, removes the unit files, and deletes
+`/opt/iec104/`.
+
 ## Protocol exchanges exercised
 
 | Direction | ASDU | Cause out | Cause back |

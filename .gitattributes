@@ -1,0 +1,4 @@
+# Force LF line endings for shell scripts and systemd units regardless of the
+# platform / core.autocrlf setting: CRLF breaks bash and displeases systemd.
+*.sh       text eol=lf
+*.service  text eol=lf

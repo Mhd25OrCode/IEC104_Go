@@ -1,6 +1,9 @@
 # build artifacts
 *.exe
 
+# cross-build output (Raspberry Pi CM5 / linux-arm64)
+dist/
+
 # local test logs
 logs/
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=IEC 60870-5-104 master (client) + Iec104Bridge gRPC server
+Documentation=https://github.com/Mhd25OrCode/IEC104_Go
+# Start after the outstation so the master can connect immediately. "Wants"
+# (not "Requires") keeps the client up across an outstation restart.
+After=network-online.target iec104-server.service
+Wants=network-online.target iec104-server.service
+
+[Service]
+Type=simple
+User=iec104
+Group=iec104
+WorkingDirectory=/opt/iec104
+# Creates and owns /run/msl5 (removed automatically when the unit stops),
+# which is where the Iec104Bridge gRPC Unix Domain Socket lives.
+RuntimeDirectory=msl5
+RuntimeDirectoryMode=0755
+ExecStart=/opt/iec104/iec104-client -host 127.0.0.1 -port 2404 -grpc-socket /run/msl5/iec104-bridge.sock
+Restart=always
+RestartSec=2
+# If the NestJS backend runs as a different user and cannot reach the socket,
+# add its group here and/or relax the socket umask:
+#SupplementaryGroups=nestjs
+#UMask=0002
+
+[Install]
+WantedBy=multi-user.target
