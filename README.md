@@ -16,7 +16,7 @@ iec104_server/   outstation ("slave")
   handler.go     CommandHandler + process image + periodic/spontaneous reporting
   confirm.go     fresh-ASDU confirmation builders (the bug workaround)
 iec104_client/   master ("client")
-  main.go        connection lifecycle, starts the gRPC bridge server, optional -demo command sequence
+  main.go        connection lifecycle, optional gRPC bridge server (-demo skips it), -demo command sequence
   call.go        ASDUCall implementation (all replies & data), forwards every event to the gRPC bridge
   grpcserver.go  Iec104Bridge gRPC service (Dispatch / SubscribeEvents) over a Unix Domain Socket
   typemap.go     asdu_typ <-> asdu.TypeID conversion for the gRPC contract
@@ -37,9 +37,11 @@ cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 # terminal 1 - outstation (runs until Ctrl+C, or pass -duration)
 .\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
 
-# terminal 2 - master (idles waiting for gRPC Dispatch calls by default; add -demo to
-# reinstate the old always-on command sequence)
-.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s
+# terminal 2 - master: by default it starts the gRPC bridge and idles waiting for
+# Dispatch calls; with -demo it skips gRPC entirely and instead sends the built-in
+# demo command sequence once the outstation confirms STARTDT
+.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s          # gRPC bridge mode
+.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -demo -duration 40s   # demo only, no gRPC
 ```
 
 The executable names come from the module paths (`github.com/alfas/iec104-server`
@@ -64,8 +66,9 @@ $srv.WaitForExit()
 Flags: `-host`, `-port`, `-ca` (common address, default 1),
 server: `-period`/`-spontaneous` (reporting intervals), `-duration`,
 both: `-verbose` (enable the go-iecp5 frame/decode log, off by default).
-Client only: `-demo` (send the built-in demo command sequence instead of
-waiting for gRPC `Dispatch` calls, off by default), `-grpc-socket` (Unix
+Client only: `-demo` (skip the gRPC bridge entirely and instead send the
+built-in demo command sequence once the outstation is active, off by default;
+the `-grpc-socket` path is ignored when it is set), `-grpc-socket` (Unix
 Domain Socket path for the `Iec104Bridge` gRPC server, default
 `iec104-bridge.sock`).
 

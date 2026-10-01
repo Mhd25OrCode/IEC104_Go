@@ -12,6 +12,7 @@ import (
 
 	"github.com/wendy512/go-iecp5/asdu"
 	"github.com/wendy512/iec104/client"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -20,8 +21,8 @@ func main() {
 	ca := flag.Uint("ca", 1, "ASDU common address")
 	duration := flag.Duration("duration", 30*time.Second, "how long to run (0 = until Ctrl+C)")
 	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors)")
-	grpcSocket := flag.String("grpc-socket", "iec104-bridge.sock", "Unix Domain Socket path for the Iec104Bridge gRPC server (NestJS default: /run/msl5/iec104-bridge.sock)")
-	demo := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active, instead of waiting for gRPC Dispatch calls")
+	grpcSocket := flag.String("grpc-socket", "iec104-bridge.sock", "Unix Domain Socket path for the Iec104Bridge gRPC server (ignored with -demo; NestJS default: /run/msl5/iec104-bridge.sock)")
+	demo := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active and skip the gRPC server entirely (no Dispatch/SubscribeEvents)")
 	flag.Parse()
 
 	settings := client.NewSettings()
@@ -34,9 +35,17 @@ func main() {
 		settings.LogCfg = &client.LogCfg{Enable: true}
 	}
 
-	bridge := newBridgeServer(nil) // client wired in below, once c exists
+	// With -demo the demo sequence is the only traffic source, so the gRPC
+	// bridge is not built at all: masterCall.bridge stays nil and inbound
+	// events are logged to stdout only (bridgeServer.publishEvent is nil-safe).
+	var bridge *bridgeServer
+	if !*demo {
+		bridge = newBridgeServer(nil) // client wired in below, once c exists
+	}
 	c := client.New(settings, &masterCall{bridge: bridge})
-	bridge.client = c
+	if bridge != nil {
+		bridge.client = c
+	}
 	c.SetOnConnectHandler(func(_ *client.Client) {
 		fmt.Println("[client] connected to outstation")
 	})
@@ -50,9 +59,17 @@ func main() {
 		}
 	})
 
-	grpcServer, err := startGRPCServer(*grpcSocket, bridge)
-	if err != nil {
-		log.Fatalf("grpc server: %v", err)
+	// The gRPC bridge is an optional adapter: with -demo nothing drives it and
+	// nothing subscribes to it, so we skip it entirely.
+	var grpcServer *grpc.Server
+	if !*demo {
+		var err error
+		grpcServer, err = startGRPCServer(*grpcSocket, bridge)
+		if err != nil {
+			log.Fatalf("grpc server: %v", err)
+		}
+	} else {
+		log.Println("[client] -demo set: gRPC bridge disabled, running demo sequence only")
 	}
 
 	if err := c.Connect(); err != nil {
@@ -76,7 +93,9 @@ func main() {
 	}
 	<-ctx.Done()
 
-	grpcServer.GracefulStop()
+	if grpcServer != nil {
+		grpcServer.GracefulStop()
+	}
 	if err := c.Close(); err != nil {
 		log.Printf("close: %v", err)
 	}
