@@ -19,7 +19,7 @@ func main() {
 	host := flag.String("host", "127.0.0.1", "server host")
 	port := flag.Int("port", 2404, "server port")
 	ca := flag.Uint("ca", 1, "ASDU common address")
-	duration := flag.Duration("duration", 30*time.Second, "how long to run (0 = until Ctrl+C)")
+	duration := flag.Duration("duration", 0, "how long to run (0 = until Ctrl+C)")
 	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors)")
 	grpcSocket := flag.String("grpc-socket", "iec104-bridge.sock", "Unix Domain Socket path for the Iec104Bridge gRPC server (ignored with -demo; NestJS default: /run/msl5/iec104-bridge.sock)")
 	demo := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active and skip the gRPC server entirely (no Dispatch/SubscribeEvents)")
