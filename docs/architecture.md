@@ -59,6 +59,11 @@ document only covers how it fits into the whole system.
 | `iec104_client/typemap.go` | `asdu_typ` string ↔ `asdu.TypeID` conversion tables, plus `commandValueFromPayload` (decodes `payload_json` into the Go type `SendCmd` expects) |
 | `iec104_client/proto/iec104.proto` | Source of the `Iec104Bridge` gRPC contract (`Iec104Point`, `DispatchRequest`/`DispatchAck`, `SubscribeEvents`) |
 | `iec104_client/pb/*.go` | Generated protobuf/gRPC code from `proto/iec104.proto` (committed; regenerated with `protoc`, see §5) |
+| `build.sh` | Cross-builds the static `linux/arm64` binaries (`CGO_ENABLED=0`, `-trimpath -s -w`) into `dist/iec104-{server,client}` for the Raspberry Pi CM4/CM5 |
+| `pull.sh` | Token-authenticated `git fetch` + `git merge --ff-only` update from GitHub (PAT read from `$HOME/.iec104-git-token`); the token is never written to `.git/config` |
+| `deploy/install.sh`, `deploy/uninstall.sh` | Install / remove `/opt/iec104/` plus the systemd units (must run as root) |
+| `deploy/iec104-*.service` | systemd units: `iec104-server`, `iec104-client` (gRPC master, `enable --now`) and `iec104-client-demo` (manual-only `-demo` master, `Conflicts=` with the gRPC unit) |
+| `docs/architecture.md`, `docs/iec104_client_architecture.md` | This document and the client-side deep dive |
 
 ### 1.3 Layering
 
@@ -265,6 +270,19 @@ cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 # that is how the silent C_BO_TA_1 drop (Bug 3, §4) becomes visible
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s -verbose
 ```
+
+On the Raspberry Pi CM4/CM5 (Debian arm64) the same sources are pulled, built and
+installed as systemd services from the repo root (full walk-through in the root
+[`README.md`](../README.md)):
+
+```bash
+./pull.sh                  # git fetch + fast-forward (PAT from ~/.iec104-git-token)
+./build.sh                 # dist/iec104-{server,client}, static linux/arm64, CGO off
+sudo ./deploy/install.sh   # /opt/iec104 + systemd enable --now
+```
+
+Both programs' `-duration` defaults to `0` (= run until Ctrl+C/SIGTERM), so the
+systemd units need no timer to stay up.
 
 The two binaries are named after the module paths
 (`github.com/alfas/iec104-server` / `-client`), not after the folder names

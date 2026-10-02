@@ -21,8 +21,9 @@ WorkingDirectory=/opt/iec104
 # /run/msl5 is unused here; declared only to keep both client units symmetric.
 RuntimeDirectory=msl5
 RuntimeDirectoryMode=0755
-# -duration 0 = run until "systemctl stop" (the 30s default would make the unit
-# exit and, under Restart=always, replay the sequence every 30s).
+# -duration 0 = run until "systemctl stop". 0 is already the client's flag
+# default (run until Ctrl+C/SIGTERM), but the unit states it explicitly so the
+# intent survives any future change to that default.
 ExecStart=/opt/iec104/iec104-client -host 127.0.0.1 -port 2404 -demo -duration 0
 # Not Restart=always: the demo is a manual action, not a service. on-failure
 # still covers "outstation not listening yet" (main.go exits on a failed

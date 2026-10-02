@@ -21,6 +21,10 @@ iec104_client/   master ("client")
   grpcserver.go  Iec104Bridge gRPC service (Dispatch / SubscribeEvents) over a Unix Domain Socket
   typemap.go     asdu_typ <-> asdu.TypeID conversion for the gRPC contract
   proto/         Iec104Bridge .proto contract; pb/ holds the generated code
+build.sh         cross-build static linux/arm64 binaries into dist/ (CGO off)
+pull.sh          token-authenticated fast-forward pull from GitHub (Raspberry Pi)
+deploy/          systemd units + install.sh / uninstall.sh for the Pi
+docs/            architecture.md, iec104_client_architecture.md
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) and
@@ -64,7 +68,8 @@ $srv.WaitForExit()
 ```
 
 Flags: `-host`, `-port`, `-ca` (common address, default 1),
-server: `-period`/`-spontaneous` (reporting intervals), `-duration`,
+server: `-period`/`-spontaneous` (reporting intervals),
+both: `-duration` (how long to run; **default `0`** = run until Ctrl+C/SIGTERM),
 both: `-verbose` (enable the go-iecp5 frame/decode log, off by default).
 Client only: `-demo` (skip the gRPC bridge entirely and instead send the
 built-in demo command sequence once the outstation is active, off by default;
@@ -217,10 +222,11 @@ journalctl -u iec104-client-demo -f
 
 The demo unit deliberately has **no `[Install]` section**: it is manual-only,
 so `systemctl enable` refuses it and `systemctl preset-all` can never start it
-at boot. It runs with `-duration 0` so it stays up until you stop it (the 30 s
-default would make it exit and replay the sequence under `Restart=always`), and
-uses `Restart=on-failure` instead of `Restart=always` so a crash loop cannot
-replay the demo. Because `-demo` skips the gRPC bridge entirely (`main.go`
+at boot. It runs with an explicit `-duration 0` — `0` is now the flag default
+(run until stopped), but the unit states it so the intent survives any future
+default change — so it stays up until you stop it, and uses
+`Restart=on-failure` instead of `Restart=always` so neither a clean exit nor a
+crash loop can replay the demo. Because `-demo` skips the gRPC bridge entirely (`main.go`
 never calls `startGRPCServer`), no `/run/msl5/iec104-bridge.sock` exists while
 it runs - which is precisely why starting it stops the gRPC unit.
 

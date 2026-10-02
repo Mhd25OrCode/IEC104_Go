@@ -17,7 +17,8 @@ test system in this repository.
   (the `Iec104Bridge` gRPC service, §7). Go 1.27.1.
 - **Module:** `github.com/alfas/iec104-client` → binary `iec104-client.exe`.
 - **Defaults:** host `127.0.0.1`, port **2404**, common address (CA) **1**,
-  run time **30 s**, ASDU params `asdu.ParamsWide` (COT 2 B, CA 2 B,
+  run time indefinite (**`-duration 0`**, the default — pass e.g. `30s` for a
+  fixed run), ASDU params `asdu.ParamsWide` (COT 2 B, CA 2 B,
   **IOA 3 B**, UTC), gRPC socket path `iec104-bridge.sock`.
 
 ---
@@ -188,10 +189,10 @@ Consequences for application code:
 host     := flag.String("host", "127.0.0.1", "server host")
 port     := flag.Int("port", 2404, "server port")
 ca       := flag.Uint("ca", 1, "ASDU common address")
-duration := flag.Duration("duration", 30*time.Second, "how long to run (0 = until Ctrl+C)")
+duration := flag.Duration("duration", 0, "how long to run (0 = until Ctrl+C)")
 verbose  := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging…")
 grpcSocket := flag.String("grpc-socket", "iec104-bridge.sock", "Unix Domain Socket path for the Iec104Bridge gRPC server")
-demo     := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active, instead of waiting for gRPC Dispatch calls")
+demo     := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active and skip the gRPC server entirely (no Dispatch/SubscribeEvents)")
 ```
 
 `ca` is converted to `uint16` only at the call site of `sendDemoCommands`; the
@@ -675,15 +676,25 @@ cd iec104_client; go build ./...          # writes .\iec104_client\iec104-client
 .\iec104_client\iec104-client.exe -duration 40s -verbose
 ```
 
+For the Raspberry Pi CM4/CM5 (see the root [`README.md`](../README.md) for the full
+`pull -> build -> install` workflow), build and install the static arm64 binaries
+from the repo root:
+
+```bash
+./pull.sh
+./build.sh                 # -> dist/iec104-client (static linux/arm64, CGO off)
+sudo ./deploy/install.sh   # -> /opt/iec104 + systemd iec104-client[-demo].service
+```
+
 | Flag | Default | Meaning |
 | :--- | :--- | :--- |
 | `-host` | `127.0.0.1` | outstation host |
 | `-port` | `2404` | outstation port |
 | `-ca` | `1` | ASDU common address used for all sent commands |
-| `-duration` | `30s` | run time; `0` = until Ctrl+C / SIGTERM |
+| `-duration` | `0` | run time; `0` = until Ctrl+C / SIGTERM (indefinite) |
 | `-verbose` | `false` | enable the dependency `clog` (frames + decode errors) |
 | `-grpc-socket` | `iec104-bridge.sock` | Unix Domain Socket path the `Iec104Bridge` gRPC server listens on (§7) |
-| `-demo` | `false` | send the built-in demo command sequence once active, instead of waiting for gRPC `Dispatch` calls |
+| `-demo` | `false` | send the built-in demo command sequence once active and skip the gRPC server entirely (no `Dispatch`/`SubscribeEvents`) |
 
 The binary is named after the module path (`github.com/alfas/iec104-client`), not
 the folder, hence `iec104-client.exe`.
