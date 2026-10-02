@@ -184,14 +184,45 @@ sudo ./deploy/install.sh
 ```
 
 The installer creates an `iec104` system user, copies the binaries to
-`/opt/iec104/`, installs `deploy/iec104-server.service` and
-`deploy/iec104-client.service` into `/etc/systemd/system/`, then runs
-`daemon-reload` and `enable --now` on both.
+`/opt/iec104/`, and installs three units into `/etc/systemd/system/`:
+`deploy/iec104-server.service`, `deploy/iec104-client.service` (the gRPC
+master) and `deploy/iec104-client-demo.service` (the `-demo` master). It then
+runs `daemon-reload` and `enable --now` on the first two only - the demo unit
+is installed for manual use and is never enabled (see below).
 
 ```bash
 systemctl status iec104-server iec104-client
 journalctl -u iec104-server -u iec104-client -f
 ```
+
+### Switching between gRPC bridge and demo mode
+
+`iec104-client.service` (gRPC bridge) and `iec104-client-demo.service`
+(built-in `-demo` command sequence, no gRPC) are two ordinary units - not a
+systemd template. `systemctl start` can never forward arguments to the process
+(`systemctl start iec104-client -demo` makes systemctl parse `-demo` itself and
+fail with `invalid option -- 'd'`), and a template instance cannot inject a
+leading `-demo` either, because a leading `-` on a word in `ExecStart=` is
+systemd's own ignore-failure prefix.
+
+Both units declare a mirrored `Conflicts=`, so they are mutually exclusive and
+switching modes is a plain `start`:
+
+```bash
+sudo systemctl start iec104-client-demo    # demo mode (stops iec104-client)
+sudo systemctl start iec104-client         # gRPC mode (stops the demo unit)
+sudo systemctl stop  iec104-client-demo
+journalctl -u iec104-client-demo -f
+```
+
+The demo unit deliberately has **no `[Install]` section**: it is manual-only,
+so `systemctl enable` refuses it and `systemctl preset-all` can never start it
+at boot. It runs with `-duration 0` so it stays up until you stop it (the 30 s
+default would make it exit and replay the sequence under `Restart=always`), and
+uses `Restart=on-failure` instead of `Restart=always` so a crash loop cannot
+replay the demo. Because `-demo` skips the gRPC bridge entirely (`main.go`
+never calls `startGRPCServer`), no `/run/msl5/iec104-bridge.sock` exists while
+it runs - which is precisely why starting it stops the gRPC unit.
 
 The client unit sets `RuntimeDirectory=msl5`, so systemd creates and owns
 `/run/msl5/` (and removes it on stop) for the gRPC socket. If the NestJS backend

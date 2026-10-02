@@ -5,6 +5,10 @@ Documentation=https://github.com/Mhd25OrCode/IEC104_Go
 # (not "Requires") keeps the client up across an outstation restart.
 After=network-online.target iec104-server.service
 Wants=network-online.target iec104-server.service
+# Only one master may own the outstation link: starting this unit stops the
+# demo client, and starting the demo client stops this one (mirrored
+# Conflicts= in iec104-client-demo.service).
+Conflicts=iec104-client-demo.service
 
 [Service]
 Type=simple

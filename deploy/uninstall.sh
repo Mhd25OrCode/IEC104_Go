@@ -8,7 +8,7 @@ set -euo pipefail
 
 PREFIX="/opt/iec104"
 UNITS_DIR="/etc/systemd/system"
-UNITS=("iec104-server.service" "iec104-client.service")
+UNITS=("iec104-server.service" "iec104-client.service" "iec104-client-demo.service")
 
 if [[ "$(id -u)" -ne 0 ]]; then
 	echo "error: run as root (sudo $0)" >&2
