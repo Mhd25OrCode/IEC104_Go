@@ -72,13 +72,73 @@ the `-grpc-socket` path is ignored when it is set), `-grpc-socket` (Unix
 Domain Socket path for the `Iec104Bridge` gRPC server, default
 `iec104-bridge.sock`).
 
-## Raspberry Pi CM5 (Debian trixie, arm64) build & deploy
+## Pull / update (`pull.sh`)
 
-The deployment target is a Raspberry Pi Compute Module 5 running
-**Debian GNU/Linux 13 (trixie), 64-bit arm64**, with systemd. Both programs run
-on the CM5: the outstation on `0.0.0.0:2404` and the master (with its
-`Iec104Bridge` gRPC server) connecting to it over loopback and exposing the
-socket at `/run/msl5/iec104-bridge.sock`.
+`pull.sh` is step 1 of the Raspberry Pi workflow: it pulls the latest changes
+from `github.com/Mhd25OrCode/IEC104_Go` into the working copy. The remote is
+HTTPS, so a GitHub **Personal Access Token (PAT)** is required, and it is read
+from a **local file that never leaves the Pi** (nothing token-related is ever
+pushed to GitHub):
+
+```bash
+# one-time setup on the Pi (token is not echoed and not written to bash history)
+umask 077
+read -rsp 'GitHub PAT: ' TOK; printf '%s\n' "$TOK" > "$HOME/.iec104-git-token"; unset TOK
+chmod 600 "$HOME/.iec104-git-token"
+
+# optional sanity check: expect 200
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $(< "$HOME/.iec104-git-token")" \
+  https://api.github.com/repos/Mhd25OrCode/IEC104_Go
+```
+
+The file holds the token on a single line, with no `Bearer` prefix and no
+quotes (CR/LF and surrounding whitespace are trimmed). A fine-grained token with
+`Contents: Read-only` on this one repository is enough.
+
+```bash
+./pull.sh                       # token from $HOME/.iec104-git-token, branch main
+./pull.sh --token-file /root/.pat
+./pull.sh --branch main --dry-run
+./pull.sh --stash               # keep local edits in a git stash, then pull
+./pull.sh --force               # discard local edits to tracked files, then pull
+./pull.sh --clone               # bootstrap an unpacked copy into a git working copy
+```
+
+Token resolution order: `--token-file <path>` → `$IEC104_GIT_TOKEN_FILE` →
+`$HOME/.iec104-git-token`. The token is never written to `.git/config` (the
+fetch uses an explicit `https://x-access-token:<PAT>@…` URL and then
+`git merge --ff-only FETCH_HEAD`), it is redacted from all output, and the
+script refuses to touch a dirty tree unless `--stash`/`--force` is given.
+`.iec104-git-token` (and `*-git-token`) are also listed in `.gitignore` and
+`.git/info/exclude` as a second line of defence. Since `dist/` and `logs/` are
+gitignored, pulling never clobbers build artifacts or captured logs.
+
+A non-fast-forward upstream (force-push) stops the script instead of silently
+resetting the tree; `--force` only discards *your own* local edits.
+
+## Raspberry Pi CM4 / CM5 (Debian trixie, arm64) build & deploy
+
+The deployment target is a Raspberry Pi Compute Module 4 or 5 running a
+**64-bit arm64 OS** — Debian GNU/Linux 13 (trixie) arm64 for the CM5, and
+**Raspberry Pi OS 64-bit (Bookworm) or Debian arm64** for the CM4 — with
+systemd. The CM4 is Cortex-A72 (ARMv8-A, AArch64), so the `GOARCH=arm64`
+binaries from `build.sh` are natively supported; a 32-bit (armhf) OS is not
+supported and fails with `Exec format error` (verify with `uname -m`, which
+must print `aarch64`).
+
+Both programs run on the same board: the outstation on `0.0.0.0:2404` and the
+master (with its `Iec104Bridge` gRPC server) connecting to it over loopback and
+exposing the socket at `/run/msl5/iec104-bridge.sock`.
+
+### End-to-end workflow (pull → build → install)
+
+```bash
+cd ~/IEC104_Go
+./pull.sh                  # 1) pull   - see "Pull / update" above
+./build.sh                 # 2) build  - dist/iec104-{server,client} (static arm64)
+sudo ./deploy/install.sh   # 3) run    - /opt/iec104 + systemd enable --now
+```
 
 ### Prerequisites
 
