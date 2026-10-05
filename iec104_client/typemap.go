@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cast"
 	"github.com/wendy512/go-iecp5/asdu"
@@ -71,9 +72,36 @@ var typeIDByName = map[string]asdu.TypeID{
 }
 
 // typeIDFromName resolves a bridge point.asduTyp string to its asdu.TypeID.
+//
+// The canonical form is the bare mnemonic (IEC104_GO_BRIDGE.md), e.g.
+// "C_SC_NA_1". Some MSL5 point records append the numeric type identification
+// to the mnemonic - "C_SC_NA_1_45", where 45 is C_SC_NA_1's TypeID - so one
+// trailing "_<digits>" suffix is stripped and the lookup retried. The suffix is
+// only dropped once the remaining prefix is itself a known mnemonic, so the
+// plain "C_SC_NA_1" (which legitimately ends in "_1") is never mangled.
 func typeIDFromName(name string) (asdu.TypeID, bool) {
-	id, ok := typeIDByName[name]
-	return id, ok
+	if id, ok := typeIDByName[name]; ok {
+		return id, true
+	}
+	if i := strings.LastIndexByte(name, '_'); i > 0 && isDigits(name[i+1:]) {
+		if id, ok := typeIDByName[name[:i]]; ok {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// isDigits reports whether s is a non-empty run of ASCII digits.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // typeNameByID is the reverse of typeIDByName. asdu.TypeID.String() returns

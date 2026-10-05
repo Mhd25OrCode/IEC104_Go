@@ -146,6 +146,23 @@ func TestDispatchAck(t *testing.T) {
 	}
 }
 
+func TestDispatchAcceptsMnemonicWithTypeIDSuffix(t *testing.T) {
+	h := newHarness(t)
+	h.next(t) // ready
+
+	// MSL5 sends "<mnemonic>_<typeID>" (45 is C_SC_NA_1's type id); the bridge
+	// must dispatch it as the same single command as the bare mnemonic.
+	h.send(t, `{"op":"dispatch","reqId":"11","type":"OUT","points":[`+
+		`{"id":"z","asduTyp":"C_SC_NA_1_45","asduLow":1,"ioaLow":9,"payload":{"value":true}}]}`)
+	ack := h.next(t)
+	if ack["reqId"] != "11" || ack["accepted"] != true || ack["message"] != "" {
+		t.Fatalf("unexpected ack: %v", ack)
+	}
+	if got := h.fake.sent[0]; got.name != "cmd" || got.ca != 1 || got.ioa != 9 || got.value != true {
+		t.Fatalf("unexpected single command: %+v", got)
+	}
+}
+
 func TestDispatchRejectedAck(t *testing.T) {
 	h := newHarness(t)
 	h.next(t)

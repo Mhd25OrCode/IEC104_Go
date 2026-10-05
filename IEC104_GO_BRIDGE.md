@@ -80,7 +80,7 @@ Same field names and `null` semantics as the backend's `Iec104Dto`
 | `id` | string | backend row id; **echo it back on events** |
 | `type` | `"IN"` \| `"OUT"` | required on events |
 | `designation`, `channelId`, `channelName` | string | optional, echo back |
-| `asduTyp` | string | mnemonic such as `C_SC_NA_1`; required on events |
+| `asduTyp` | string | mnemonic such as `C_SC_NA_1`; required on events. The MSL5 `<mnemonic>_<typeID>` form (e.g. `C_SC_NA_1_45`) is accepted too — see below |
 | `asduHigh`, `asduLow` | int or `null` | common address, big-endian split (as before) |
 | `ioaHigh`, `ioaMiddle`, `ioaLow` | int or `null` | information object address, big-endian split |
 | `typ` | `"Wert"` \| `"Prozent"` | |
@@ -94,6 +94,14 @@ Unknown fields must be ignored in both directions. Missing/`null` numbers mean
 "not set": unlike proto3, `0` is now a legitimate value and is not confused
 with "unset". The backend only accepts integers or `null` for the numeric
 fields of an event; anything else is turned into `null`.
+
+`asduTyp` is normally the bare 101 mnemonic. The MSL5 backend currently appends
+the numeric type identification to it (`"C_SC_NA_1_45"` for `"C_SC_NA_1"`,
+whose TypeID is 45), and **the bridge tolerates that**: one trailing
+`_<digits>` suffix is stripped and the lookup retried, but only when the
+remaining prefix is itself a known mnemonic - so the mnemonic proper (which
+already ends in `_1`) is never mangled. Unknown names are still rejected per
+point (`accepted:false`). Events are always emitted with the bare mnemonic.
 
 ## 3. Required changes in the Go repository
 

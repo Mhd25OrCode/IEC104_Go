@@ -453,7 +453,9 @@ protocol is [`IEC104_GO_BRIDGE.md`](../IEC104_GO_BRIDGE.md); in short:
 
 `point` is the JSON form of the backend's `Iec104Dto`: an opaque
 `id`/`designation`/`channelId` the backend uses to correlate frames, the
-wire-format `asduTyp` mnemonic (e.g. `"C_SC_NA_1"`), the Common Address and
+wire-format `asduTyp` mnemonic (e.g. `"C_SC_NA_1"`; the MSL5 form
+`"C_SC_NA_1_45"` — mnemonic plus its numeric TypeID — is accepted too, see
+`typemap.go`), the Common Address and
 Information Object Address split into big-endian bytes (`asduHigh/asduLow`,
 `ioaHigh/ioaMiddle/ioaLow` — IEC 104's 3-octet IOA has no single Go integer
 equivalent, hence the split; `null` = not set), and a real JSON `payload`
