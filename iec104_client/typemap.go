@@ -8,9 +8,9 @@ import (
 	"github.com/wendy512/go-iecp5/asdu"
 )
 
-// typeIDByName converts the gRPC contract's Iec104Point.asdu_typ string (see
-// iec104_client/proto/iec104.proto) into the wendy512/go-iecp5 asdu.TypeID
-// this client sends/decodes. Names match the companion standard 101 mnemonics
+// typeIDByName converts the bridge protocol's point.asduTyp string (see
+// IEC104_GO_BRIDGE.md) into the wendy512/go-iecp5 asdu.TypeID this client
+// sends/decodes. Names match the companion standard 101 mnemonics
 // exposed by the asdu package (verified via `go doc asdu.TypeID`).
 var typeIDByName = map[string]asdu.TypeID{
 	"M_SP_NA_1": asdu.M_SP_NA_1,
@@ -70,14 +70,14 @@ var typeIDByName = map[string]asdu.TypeID{
 	"C_TS_TA_1": asdu.C_TS_TA_1,
 }
 
-// typeIDFromName resolves a gRPC Iec104Point.asdu_typ string to its asdu.TypeID.
+// typeIDFromName resolves a bridge point.asduTyp string to its asdu.TypeID.
 func typeIDFromName(name string) (asdu.TypeID, bool) {
 	id, ok := typeIDByName[name]
 	return id, ok
 }
 
 // typeNameByID is the reverse of typeIDByName. asdu.TypeID.String() returns
-// "TID<C_IC_NA_1>" (a debug format), not the bare mnemonic the gRPC contract
+// "TID<C_IC_NA_1>" (a debug format), not the bare mnemonic the bridge protocol
 // expects, so outgoing events go through this table instead.
 var typeNameByID = func() map[asdu.TypeID]string {
 	m := make(map[asdu.TypeID]string, len(typeIDByName))
@@ -87,7 +87,7 @@ var typeNameByID = func() map[asdu.TypeID]string {
 	return m
 }()
 
-// typeNameFromID resolves an asdu.TypeID to its gRPC Iec104Point.asdu_typ string.
+// typeNameFromID resolves an asdu.TypeID to its bridge point.asduTyp string.
 func typeNameFromID(typeId asdu.TypeID) string {
 	if name, ok := typeNameByID[typeId]; ok {
 		return name
@@ -96,15 +96,15 @@ func typeNameFromID(typeId asdu.TypeID) string {
 }
 
 // commandValueFromPayload decodes the `{"value": ...}` JSON object carried in
-// Iec104Point.payload_json into the Go type client.Client.SendCmd expects for
+// point.payload into the Go type client.Client.SendCmd expects for
 // typeId, mirroring the type switch in wendy512/iec104's doSend.
-func commandValueFromPayload(typeId asdu.TypeID, payloadJSON string) (any, error) {
+func commandValueFromPayload(typeId asdu.TypeID, payloadJSON json.RawMessage) (any, error) {
 	var payload struct {
 		Value any `json:"value"`
 	}
-	if payloadJSON != "" {
+	if len(payloadJSON) > 0 {
 		if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
-			return nil, fmt.Errorf("invalid payload_json: %w", err)
+			return nil, fmt.Errorf("invalid payload: %w", err)
 		}
 	}
 	switch typeId {
@@ -119,6 +119,6 @@ func commandValueFromPayload(typeId asdu.TypeID, payloadJSON string) (any, error
 	case asdu.C_BO_NA_1, asdu.C_BO_TA_1:
 		return cast.ToUint32E(payload.Value)
 	default:
-		return nil, fmt.Errorf("asdu_typ %v does not take a command value", typeId)
+		return nil, fmt.Errorf("asduTyp %v does not take a command value", typeId)
 	}
 }

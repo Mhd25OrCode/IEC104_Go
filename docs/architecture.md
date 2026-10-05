@@ -18,11 +18,11 @@ Documentation for the IEC 104 master + outstation test system in this repository
 Two cooperating programs exchange IEC 104 frames over one TCP connection:
 
 ```text
-                       gRPC (Iec104Bridge)            ┌──────────────────────────┐      TCP 2404 (IEC 104)       ┌──────────────────────────┐
-                       Unix Domain Socket              │  iec104_client  (master) │ ◄───────────────────────────► │ iec104_server (outstation)│
+                       stdin/stdout (NDJSON)          ┌──────────────────────────┐      TCP 2404 (IEC 104)       ┌──────────────────────────┐
+                       child process                   │  iec104_client  (master) │ ◄───────────────────────────► │ iec104_server (outstation)│
    NestJS backend  ◄──────────────────────────────────►│                          │  commands (C_*)               │                          │
-   (external, not   Dispatch(points) →                 │  main.go                 │  ───────────────────────────► │ main.go                  │
-   in this repo)    ← stream Iec104Point (events)       │   flags, connect,        │                               │  flags, listener,        │
+   (external, not   dispatch(points) → ack                │  main.go                 │  ───────────────────────────► │ main.go                  │
+   in this repo)    ← event frames                      │   flags, connect,        │                               │  flags, listener,        │
                                                         │   -demo command seq.     │  confirmations & data         │  lifecycle               │
                                                         │                          │  (M_*, ActivationCon/Term)    │                          │
                                                         │  call.go                 │  ◄─────────────────────────── │ handler.go               │
@@ -30,19 +30,21 @@ Two cooperating programs exchange IEC 104 frames over one TCP connection:
                                                         │   all inbound callbacks  │                               │  process image, GI / CI, │
                                                         │   → bridge.publishEvent  │                               │  periodic + spontaneous  │
                                                         │                          │                               │ confirm.go               │
-                                                        │  grpcserver.go           │                               │  fresh-ASDU confirmation │
-                                                        │   bridgeServer, registry,│                               │  builders (bug workaround)│
-                                                        │   eventHub (pub/sub)     │                               │                          │
+                                                        │  bridge.go               │                               │  fresh-ASDU confirmation │
+                                                        │   NDJSON reader/writer,  │                               │  builders (bug workaround)│
+                                                        │   registry, event queue  │                               │                          │
                                                         │  typemap.go              │                               │                          │
-                                                        │   asdu_typ <-> TypeID    │                               │                          │
+                                                        │   asduTyp <-> TypeID     │                               │                          │
                                                         └──────────────────────────┘                               └──────────────────────────┘
 ```
 
-The gRPC layer is an optional adapter bolted onto the existing master: it lets
-an external process (NestJS) drive the same `*client.Client` that the built-in
-`-demo` command sequence uses, and observe every inbound ASDU as a stream of
-`Iec104Point` messages. Full detail (proto contract, `typemap.go`,
-`grpcserver.go` internals) lives in
+The stdio bridge is an optional adapter bolted onto the existing master: the
+MSL5 backend spawns the client binary as a **child process** (both run on the
+same Raspberry Pi) and talks to it over **stdin/stdout using newline-delimited
+JSON (NDJSON)**. That lets the backend drive the same `*client.Client` that the
+built-in `-demo` command sequence uses, and observe every inbound ASDU as a
+stream of `event` frames. Full detail (wire protocol, `typemap.go`, `bridge.go`
+internals) lives in [`IEC104_GO_BRIDGE.md`](../IEC104_GO_BRIDGE.md) and
 [`iec104_client_architecture.md`](iec104_client_architecture.md) §7; this
 document only covers how it fits into the whole system.
 
@@ -53,16 +55,15 @@ document only covers how it fits into the whole system.
 | `iec104_server/main.go` | Flags (`-host`, `-port`, `-ca`, `-period`, `-spontaneous`, `-duration`), listener lifecycle, graceful shutdown on `-duration` or Ctrl+C/SIGTERM |
 | `iec104_server/handler.go` | `station` — implements `server.CommandHandler`: process image, general/counter interrogation, read/clock-sync/reset/delay/test handlers, control-command dispatch, background reporting goroutines |
 | `iec104_server/confirm.go` | Confirmation builders that construct **fresh ASDUs** — the `SendReplyMirror()` bug workaround (see §4) |
-| `iec104_client/main.go` | Flags (`-host`, `-port`, `-ca`, `-duration`, `-grpc-socket`, `-demo`), connection settings (`AutoConnect`), starts the gRPC bridge server, optional demo command sequence fired after STARTDT (only with `-demo`) |
+| `iec104_client/main.go` | Flags (`-host`, `-port`, `-ca`, `-duration`, `-verbose`, `-demo`), connection settings (`AutoConnect`), keeps stdout for protocol frames only (everything else goes to stderr), starts the stdio bridge, shuts down on stdin EOF / SIGTERM, optional demo command sequence fired after STARTDT (only with `-demo`) |
 | `iec104_client/call.go` | `masterCall` — implements `client.ASDUCall`: logs every reply, confirmation and monitoring value, and forwards each one to `bridge.publishEvent` |
-| `iec104_client/grpcserver.go` | `bridgeServer` — implements the generated `pb.Iec104BridgeServer` (`Dispatch`, `SubscribeEvents`) over a Unix Domain Socket; `registry` correlates `(CommonAddr, InfoObjAddr)` to the last dispatched point; `eventHub` is a non-blocking pub/sub fan-out |
-| `iec104_client/typemap.go` | `asdu_typ` string ↔ `asdu.TypeID` conversion tables, plus `commandValueFromPayload` (decodes `payload_json` into the Go type `SendCmd` expects) |
-| `iec104_client/proto/iec104.proto` | Source of the `Iec104Bridge` gRPC contract (`Iec104Point`, `DispatchRequest`/`DispatchAck`, `SubscribeEvents`) |
-| `iec104_client/pb/*.go` | Generated protobuf/gRPC code from `proto/iec104.proto` (committed; regenerated with `protoc`, see §5) |
+| `iec104_client/bridge.go` | `bridge` — the NDJSON stdio protocol (`ready`, `dispatch` → `ack`, `event`); `point` is the JSON form of the backend's `Iec104Dto`; `registry` correlates `(CommonAddr, InfoObjAddr)` to the last dispatched point; one writer goroutine owns stdout and drains a single non-blocking event channel |
+| `iec104_client/bridge_test.go` | Pipe-based round-trip tests (`ready`, `dispatch` → `ack`, events, EOF shutdown, stdout contains only JSON lines) |
+| `iec104_client/typemap.go` | `asduTyp` string ↔ `asdu.TypeID` conversion tables, plus `commandValueFromPayload` (decodes the `payload` object into the Go type `SendCmd` expects) |
 | `build.sh` | Cross-builds the static `linux/arm64` binaries (`CGO_ENABLED=0`, `-trimpath -s -w`) into `dist/iec104-{server,client}` for the Raspberry Pi CM4/CM5 |
 | `pull.sh` | Token-authenticated `git fetch` + `git merge --ff-only` update from GitHub (PAT read from `$HOME/.iec104-git-token`); the token is never written to `.git/config` |
 | `deploy/install.sh`, `deploy/uninstall.sh` | Install / remove `/opt/iec104/` plus the systemd units (must run as root) |
-| `deploy/iec104-*.service` | systemd units: `iec104-server`, `iec104-client` (gRPC master, `enable --now`) and `iec104-client-demo` (manual-only `-demo` master, `Conflicts=` with the gRPC unit) |
+| `deploy/iec104-*.service` | systemd units: `iec104-server` (`enable --now`) and `iec104-client-demo` (manual-only `-demo` master). The bridge client has no unit: the backend spawns `/opt/iec104/iec104-client` (`IEC104_BRIDGE_BIN`) |
 | `docs/architecture.md`, `docs/iec104_client_architecture.md` | This document and the client-side deep dive |
 
 ### 1.3 Layering
@@ -151,7 +152,7 @@ AppendFloat32 / AppendCP56Time2a / AppendCP16Time2a` — never
 | `OnASDU` | everything else: monitoring data (single / double / measured-normal / measured-float — including the CP56-tagged `M_ME_TF_1`, logged with its type id — / integrated totals) and command confirmations via `onCommandReply` (`C_TS_TA_1`, `C_SC_*`, `C_DC_*`, `C_SE_*`, `C_BO_*`) |
 
 Every one of these callbacks also calls `m.bridge.publishEvent(ca, ioa, typeId,
-cot, value)` (nil-safe, so it's a no-op when no gRPC layer is wired up) —
+cot, value)` (nil-safe, so it's a no-op when no bridge is wired up, i.e. with `-demo`) —
 see §5 for what that feeds.
 
 ---
@@ -169,11 +170,11 @@ client: Connect()  (AutoConnect = true)
    ▼
 client SetServerActiveHandler fires: "outstation active"
    └─ -demo set?  → sendDemoCommands()  — see §2.2
-      otherwise  → wait for gRPC Dispatch() calls from the NestJS backend — see §5
+      otherwise  → serve dispatch requests from the NestJS backend on stdin — see §5
    │
    ├─ server background reporting running (see §2.3)
    ▼
-run until -duration elapses or Ctrl+C / SIGTERM
+run until -duration elapses, Ctrl+C / SIGTERM or (bridge mode) stdin EOF
    ▼
 client Close()  /  server Stop()
 ```
@@ -181,7 +182,7 @@ client Close()  /  server Stop()
 ### 2.2 Demo command sequence (client → server)
 
 Opt-in via the `-demo` flag (default off); with `-demo` unset the client instead
-waits idle for gRPC `Dispatch` calls (§5). When enabled, fired once STARTDT is
+waits idle for `dispatch` requests on stdin (§5). When enabled, fired once STARTDT is
 confirmed, in this order:
 
 | # | Command | Client call | Target |
@@ -256,15 +257,13 @@ cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 # terminal 1 — outstation (runs until Ctrl+C, or pass -duration)
 .\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
 
-# terminal 2 — master (idles and waits for gRPC Dispatch calls by default)
+# terminal 2 — master (bridge mode by default: reads NDJSON dispatch requests on
+# stdin, writes ready/ack/event lines to stdout, logs to stderr; stdin EOF exits)
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s
 
 # -demo reinstates the old always-on command sequence (§2.2), useful without a
-# gRPC caller attached
+# backend attached
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s -demo
-
-# -grpc-socket overrides the Unix Domain Socket path (default iec104-bridge.sock)
-.\iec104_client\iec104-client.exe -grpc-socket /run/msl5/iec104-bridge.sock
 
 # add -verbose to either program to print the raw cs104 frame/decode log;
 # that is how the silent C_BO_TA_1 drop (Bug 3, §4) becomes visible
@@ -433,50 +432,55 @@ API, so there is **no application-level workaround** — only a patched library
 See `iec_60870_5_104_bug_report.md` for the full analysis, the list of
 verified-working functions, and the updated status table.
 
-## 5. gRPC bridge (`Iec104Bridge`)
+## 5. Stdio bridge (NDJSON)
 
-`iec104_client` additionally exposes the master as a gRPC service so an
-external process (the MSL5 NestJS backend) can drive it instead of — or in
-addition to — the built-in `-demo` sequence. The contract lives in
-`iec104_client/proto/iec104.proto` and is served over a **Unix Domain Socket**
-(default path `iec104-bridge.sock`, overridable with `-grpc-socket`), not TCP.
+The MSL5 NestJS backend and `iec104_client` run on the same Raspberry Pi, so
+they talk over the child process's **stdin/stdout using newline-delimited JSON
+(NDJSON)** instead of a network RPC. The backend (`apps/backend/src/iec104/bridge/`)
+spawns the binary (`IEC104_BRIDGE_BIN`, arguments in `IEC104_BRIDGE_ARGS`) and
+restarts it with exponential backoff if it exits. The authoritative wire
+protocol is [`IEC104_GO_BRIDGE.md`](../IEC104_GO_BRIDGE.md); in short:
 
-```text
-service Iec104Bridge {
-  rpc Dispatch(DispatchRequest) returns (DispatchAck);        // backend → client
-  rpc SubscribeEvents(SubscribeRequest) returns (stream Iec104Point); // client → backend
-}
-```
+| Channel | Content |
+| :--- | :--- |
+| stdin | `{"op":"dispatch","reqId":"7","type":"OUT","points":[…]}` requests from the backend; **EOF = clean shutdown** (exit 0) |
+| stdout | **protocol only**: `{"op":"ready","version":1}` once at startup, one `{"op":"ack","reqId":…,"accepted":…,"message":…}` per `dispatch`, and asynchronous `{"op":"event","point":{…}}` frames |
+| stderr | all logs and diagnostics (the backend forwards them with a `[bridge]` prefix) |
 
-`Iec104Point` is a flat superset message mirroring the backend's `iec104`
-table: it carries an opaque `id`/`designation`/`channel_id` the backend uses to
-correlate frames, the wire-format `asdu_typ` mnemonic (e.g. `"C_SC_NA_1"`), the
-Common Address and Information Object Address split into big-endian bytes
-(`asdu_high/asdu_low`, `ioa_high/ioa_middle/ioa_low` — IEC 104's 3-octet IOA has
-no single Go integer equivalent, hence the split), and a `payload_json` string
-for the command value / decoded measurement.
+`point` is the JSON form of the backend's `Iec104Dto`: an opaque
+`id`/`designation`/`channelId` the backend uses to correlate frames, the
+wire-format `asduTyp` mnemonic (e.g. `"C_SC_NA_1"`), the Common Address and
+Information Object Address split into big-endian bytes (`asduHigh/asduLow`,
+`ioaHigh/ioaMiddle/ioaLow` — IEC 104's 3-octet IOA has no single Go integer
+equivalent, hence the split; `null` = not set), and a real JSON `payload`
+object for the command value (`{"value":…}`) / decoded measurement
+(`{"value":…,"cot":…}`).
 
-**Outbound (`Dispatch`):** for each `Iec104Point` in the request,
-`bridgeServer.dispatchPoint` resolves `asdu_typ` to an `asdu.TypeID`
-(`typemap.go`), reassembles CA/IOA from the byte fields, registers the point
-under `(CA, IOA)` for later correlation, and issues the matching `Send*Cmd` /
-`SendCmd` call on the shared `*client.Client` — the same client the `-demo`
-path uses. Per-point errors are collected and returned in one `DispatchAck`
-instead of failing the whole batch.
+**Outbound (`dispatch`):** for each point in the request,
+`bridge.dispatchPoint` resolves `asduTyp` to an `asdu.TypeID` (`typemap.go`),
+reassembles CA/IOA from the byte fields, registers the point under `(CA, IOA)`
+for later correlation, and issues the matching `Send*Cmd` / `SendCmd` call on
+the shared `*client.Client` — the same client the `-demo` path uses. Per-point
+errors are collected into one `accepted:false` ack instead of failing the whole
+batch; the ack means "accepted/queued", not "the outstation answered". Requests
+are read with `bufio.Reader.ReadBytes('\n')` (not `bufio.Scanner`), so large
+batches are never truncated.
 
-**Inbound (`SubscribeEvents`):** every `masterCall` callback (§1.6) calls
-`bridge.publishEvent(ca, ioa, typeId, cot, value)`, which builds an
-`Iec104Point` (looking up the registered `id`/metadata for that `(CA, IOA)` if
-one was dispatched earlier) and fans it out to every subscribed stream via a
-non-blocking `eventHub`. Non-blocking is required because `masterCall`'s
-callbacks all run on the underlying library's single `handlerLoop` goroutine
-(see `iec104_client_architecture.md` §2.3) — a slow gRPC subscriber must never
-stall IEC 104 protocol processing; a full per-subscriber channel drops the
-frame and logs a warning instead of blocking.
+**Inbound (`event`):** every `masterCall` callback (§1.6) calls
+`bridge.publishEvent(ca, ioa, typeId, cot, value)`, which builds a `point`
+(looking up the registered `id`/metadata for that `(CA, IOA)` if one was
+dispatched earlier; otherwise `type` is inferred: `M_*` → `IN`, `C_*` → `OUT`)
+and sends it into one buffered channel drained by a **single writer goroutine
+that owns stdout**, so lines never interleave. The send is non-blocking because
+`masterCall`'s callbacks all run on the underlying library's single
+`handlerLoop` goroutine (see `iec104_client_architecture.md` §2.3) — a slow
+stdout reader must never stall IEC 104 protocol processing; when the buffer is
+full the frame is dropped and a warning is logged to stderr.
+
+**stdout hygiene:** `main` points `os.Stdout` and the standard logger at stderr
+and keeps the real stdout only for the bridge writer, and the go-iecp5 library
+logger (which would default to stdout) is given a stderr `LogProvider`. A stray
+print therefore cannot corrupt the protocol stream.
 
 See [`iec104_client_architecture.md`](iec104_client_architecture.md) §7 for the
-full file-by-file breakdown (`grpcserver.go`, `typemap.go`, code generation
-command, concurrency notes).
-
-
-
+file-by-file breakdown and concurrency notes.

@@ -7,12 +7,6 @@ dist/
 # local test logs
 logs/
 
-# downloaded protoc binary used only for local codegen
-iec104_client/tools/
-
-# gRPC bridge unix socket
-iec104_client/*.sock
-
 # local GitHub personal access token read by pull.sh - must never be committed
 .iec104-git-token
 *-git-token

@@ -13,13 +13,13 @@ test system in this repository.
 - **Library stack:** [`wendy512/iec104`](https://github.com/wendy512/iec104)
   v1.0.4 (`client` package: IEC 104 transport wrapper),
   [`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5) v1.2.5
-  (`cs104` transport state machine + `asdu` codec), and `google.golang.org/grpc`
-  (the `Iec104Bridge` gRPC service, §7). Go 1.27.1.
+  (`cs104` transport state machine + `asdu` codec). The MSL5 backend bridge (§7)
+  uses only the Go standard library (`encoding/json`, `bufio`). Go 1.27.1.
 - **Module:** `github.com/alfas/iec104-client` → binary `iec104-client.exe`.
 - **Defaults:** host `127.0.0.1`, port **2404**, common address (CA) **1**,
   run time indefinite (**`-duration 0`**, the default — pass e.g. `30s` for a
   fixed run), ASDU params `asdu.ParamsWide` (COT 2 B, CA 2 B,
-  **IOA 3 B**, UTC), gRPC socket path `iec104-bridge.sock`.
+  **IOA 3 B**, UTC), stdio bridge on stdin/stdout (NDJSON).
 
 ---
 
@@ -28,21 +28,22 @@ test system in this repository.
 The client is the IEC 104 **master**: it opens the TCP connection, activates
 data transfer with `STARTDT`, issues control-direction commands (`C_*` ASDUs)
 and receives monitoring data plus command confirmations (`M_*` / `C_*`). It
-also runs a gRPC server (`Iec104Bridge`, §7) so an external process can issue
-those same commands and subscribe to the same inbound events over a Unix
-Domain Socket instead of the demo-only in-process path.
+also runs as a **stdio bridge** (§7): the MSL5 backend spawns it as a child
+process and, over stdin/stdout using newline-delimited JSON (NDJSON), issues
+those same commands and receives the same inbound events instead of using the
+demo-only in-process path.
 
-It writes nothing to disk — every observation is printed to stdout, in
-addition to (optionally) being forwarded over gRPC:
+It writes nothing to disk — every observation is logged to **stderr** (stdout
+is reserved for protocol frames), in addition to (optionally) being forwarded to
+the backend as `event` frames:
 
 | File | Role |
 | :--- | :--- |
-| `iec104_client/main.go` | Flags, `client.Settings` construction, connect/shutdown lifecycle, starts the gRPC server, optional demo command sequence (`sendDemoCommands`, only with `-demo`) |
+| `iec104_client/main.go` | Flags, `client.Settings` construction, connect/shutdown lifecycle (stdin EOF / SIGTERM / `-duration`), redirects `os.Stdout` to stderr and hands the real stdout to the bridge, starts the stdio bridge, optional demo command sequence (`sendDemoCommands`, only with `-demo`) |
 | `iec104_client/call.go` | `masterCall` — the `client.ASDUCall` implementation: every inbound callback, plus `onCommandReply` for command confirmations; forwards every event to `bridge.publishEvent` |
-| `iec104_client/grpcserver.go` | `bridgeServer` — the `Iec104Bridge` gRPC service implementation: `Dispatch`, `SubscribeEvents`, the `registry` and `eventHub` it's built on (§7) |
-| `iec104_client/typemap.go` | `asdu_typ` string ↔ `asdu.TypeID` conversion tables and `commandValueFromPayload` (§7) |
-| `iec104_client/proto/iec104.proto` | Source of the `Iec104Bridge` gRPC contract (§7) |
-| `iec104_client/pb/*.go` | Generated protobuf/gRPC code (committed, not regenerated at build time) |
+| `iec104_client/bridge.go` | `bridge` — the NDJSON stdio protocol: `serve` (stdin reader), `dispatch`/`dispatchPoint`, `publishEvent`, the single stdout writer goroutine, the `point` JSON type and the `registry` (§7) |
+| `iec104_client/bridge_test.go` | Pipe-based round-trip tests of the bridge protocol |
+| `iec104_client/typemap.go` | `asduTyp` string ↔ `asdu.TypeID` conversion tables and `commandValueFromPayload` (§7) |
 
 Everything else (TCP, APDU framing, I-/S-/U-frames, sequence numbers, timers,
 ASDU encode/decode) lives in the two dependencies.
@@ -59,7 +60,7 @@ ASDU encode/decode) lives in the two dependencies.
 │                                                                       │
 │   main.go                                                             │
 │     flag parsing · client.NewSettings · client.New · Set*Handler      │
-│     Connect / Close · starts gRPC server · sendDemoCommands (-demo)    │
+│     Connect / Close · starts stdio bridge · sendDemoCommands (-demo)   │
 │                                                                       │
 │   call.go                                                             │
 │     masterCall  ── implements client.ASDUCall (8 inbound callbacks)   │
@@ -68,9 +69,9 @@ ASDU encode/decode) lives in the two dependencies.
 │       OnDelayAcquisition · OnASDU (+ onCommandReply)                  │
 │       every callback also calls bridge.publishEvent(...)              │
 │                                                                       │
-│   grpcserver.go / typemap.go            Iec104Bridge gRPC service     │
-│     bridgeServer.Dispatch → client.Send*Cmd   (§7)                    │
-│     bridgeServer.SubscribeEvents ← eventHub ← publishEvent            │
+│   bridge.go / typemap.go                NDJSON stdio bridge           │
+│     bridge.serve(stdin): dispatch → client.Send*Cmd → ack   (§7)      │
+│     publishEvent → out channel → writer goroutine → stdout            │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │  application never touches frames
 ┌───────────────────────────────▼───────────────────────────────────────┐
@@ -136,9 +137,11 @@ ASDU encode/decode) lives in the two dependencies.
 
 ```text
 main goroutine
-  flag.Parse → settings → client.New → Connect()            (blocks ≤ t₀)
-  → <-ctx.Done()   (‑duration timer, or Ctrl+C / SIGTERM)
-  → c.Close()  →  SendStopDt()  →  client104.Close()  →  exit
+  flag.Parse → settings → client.New → bridge.start (emits "ready")
+  → go: wait for outstation → Connect()                      (blocks ≤ t₀)
+  → go: bridge.serve(stdin)                                  (NDJSON reader)
+  → select { ctx.Done (‑duration, Ctrl+C / SIGTERM), stdin EOF, connect error }
+  → c.Close()  →  SendStopDt()  →  client104.Close()  →  bridge.stop()  →  exit
 
 cs104: running()            dial + reconnect loop   (one goroutine,
                             started by Start())
@@ -175,8 +178,8 @@ Consequences for application code:
 | `client.LogCfg` | `client/core.go` | `Enable bool`, `LogProvider` |
 | `client.Client` | `client/core.go` | `client104 *cs104.Client` (transport), `settings`, `onConnectHandler`, `connectionLostHandler` |
 | `client.command` | `client/core.go` | `typeId`, `ca`, `ioa`, `t`, `qoc`, `qos`, `value` — the request built by `SendCmd`/`Send*Cmd` |
-| `masterCall` | `call.go` | `bridge *bridgeServer` — nil-safe; forwards every callback to `bridge.publishEvent` (§7) |
-| `bridgeServer` | `grpcserver.go` | `client *client.Client`, `hub *eventHub`, `reg *registry` — the `Iec104Bridge` implementation (§7) |
+| `masterCall` | `call.go` | `bridge *bridge` — nil-safe; forwards every callback to `bridge.publishEvent` (§7) |
+| `bridge` | `bridge.go` | `client commander` (the `*client.Client`), `reg *registry`, `out chan any` (outgoing frames, drained by one writer goroutine) — the stdio protocol (§7) |
 | `cs104.Client` | `cs104/client.go` | `conn`, `rcvASDU`/`sendASDU`/`rcvRaw`/`sendRaw`, `seqNoSend`/`ackNoSend`/`seqNoRcv`/`ackNoRcv`, `pending []seqPending`, `isActive` |
 
 ---
@@ -189,16 +192,15 @@ Consequences for application code:
 host     := flag.String("host", "127.0.0.1", "server host")
 port     := flag.Int("port", 2404, "server port")
 ca       := flag.Uint("ca", 1, "ASDU common address")
-duration := flag.Duration("duration", 0, "how long to run (0 = until Ctrl+C)")
-verbose  := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging…")
-grpcSocket := flag.String("grpc-socket", "iec104-bridge.sock", "Unix Domain Socket path for the Iec104Bridge gRPC server")
-demo     := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active and skip the gRPC server entirely (no Dispatch/SubscribeEvents)")
+duration := flag.Duration("duration", 0, "how long to run (0 = until stdin closes or Ctrl+C/SIGTERM)")
+verbose  := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging…, written to stderr")
+demo     := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active and skip the stdio bridge entirely (no stdin/stdout protocol)")
 ```
 
 `ca` is converted to `uint16` only at the call site of `sendDemoCommands`; the
 rest of the file uses the pointer values directly. `-demo` defaults to `false`:
-without it, the client sends nothing on its own and simply waits for gRPC
-`Dispatch` calls (§7) once the outstation is active.
+without it, the client sends nothing on its own and simply waits for `dispatch`
+requests on stdin (§7) once the outstation is active.
 
 ### Step 2 — Build `client.Settings`
 
@@ -209,8 +211,9 @@ settings := client.NewSettings()   // Host=localhost, Port=2404, AutoConnect=tru
 settings.Host = *host
 settings.Port = *port
 settings.AutoConnect = true
-if *verbose {
-    settings.LogCfg = &client.LogCfg{Enable: true}
+settings.LogCfg = &client.LogCfg{
+    Enable:      *verbose,
+    LogProvider: stderrLogger{…},     // the library default writes to os.Stdout
 }
 ```
 
@@ -219,29 +222,35 @@ if *verbose {
 - `Params` stays `asdu.ParamsWide` → **3-octet IOA**, 2-octet COT/CA, UTC.
 - `verbose` is the only way to see library diagnostics: the underlying `clog`
   starts with `has = 0` (output disabled), and `client.LogCfg.Enable` is what
-  calls `LogMode(true)`. This matters because inbound ASDU **decode failures are
+  calls `LogMode(true)`. The `LogProvider` is always a stderr logger, because
+  the library's built-in logger writes to `os.Stdout`, which carries the
+  protocol. This matters because inbound ASDU **decode failures are
   swallowed with `Warn`** (see §5).
 
 ### Step 3 — Create the client and bind the callbacks
 
 ```go
-bridge := newBridgeServer(nil)          // client wired in below, once c exists
-c := client.New(settings, &masterCall{bridge: bridge})
-bridge.client = c
+b := newBridge(nil)               // nil with -demo; client wired in below, once c exists
+c := client.New(settings, &masterCall{bridge: b})
+b.setClient(c)
 c.SetOnConnectHandler(func(_ *client.Client) { … "connected to outstation" … })
 c.SetServerActiveHandler(func(c *client.Client) {
     … "outstation active" …
-    if *demo { sendDemoCommands(c, ca) }   // otherwise: wait for gRPC Dispatch
+    if demo { sendDemoCommands(c, ca) }    // otherwise: wait for dispatch on stdin
 })
 
-grpcServer, err := startGRPCServer(*grpcSocket, bridge)   // Iec104Bridge over UDS (§7)
+b.start(protoOut)    // writer goroutine + {"op":"ready","version":1}   (§7)
+go func() { waitForOutstation(); c.Connect() }()
+go func() { serveErr <- b.serve(in) }()   // NDJSON reader on stdin
 ```
 
-`bridge` is created before `c` because `masterCall` needs a `*bridgeServer` to
-forward events to, but `bridgeServer.client` needs the constructed `*client.Client`
-to dispatch commands on — the two-step assignment breaks that circular
-dependency. `startGRPCServer` runs the listener on its own goroutine and
-returns immediately; its `*grpc.Server` is stopped in Step 12.
+`b` is created before `c` because `masterCall` needs a `*bridge` to forward
+events to, but `bridge.client` needs the constructed `*client.Client` to
+dispatch commands on — the two-step assignment breaks that circular
+dependency. `ready` is sent as soon as the client object exists; the IEC 104
+TCP session does not have to be up yet (commands dispatched before it is are
+rejected in their `ack`, and `waitForOutstation` keeps probing the outstation
+before the first `Connect()`).
 
 `client.New` performs three chained constructions:
 
@@ -316,7 +325,7 @@ So: as soon as the TCP connection is established, the client sends
 
 The `waitgroup` from Step 4 is released here, which is what unblocks `Connect`.
 
-### Step 6 — `STARTDT_con` → server active → demo commands (or gRPC idle)
+### Step 6 — `STARTDT_con` → server active → demo commands (or bridge idle)
 
 `isActive` is `inactive` until the U-frame **`STARTDT_con`** arrives. Only then
 may I-frames flow (`cs104.Send` otherwise returns `ErrNotActive`). On that frame:
@@ -331,10 +340,10 @@ which reaches, in the application,
 
 ```go
 c.SetServerActiveHandler(func(c *client.Client) {
-    fmt.Println("[client] outstation active (STARTDT confirmed)")
-    if *demo {
-        fmt.Println("[client] -demo set - sending demo commands")
-        sendDemoCommands(c, uint16(*ca))
+    logf("[client] outstation active (STARTDT confirmed)\n")
+    if demo {
+        logf("[client] -demo set - sending demo commands\n")
+        sendDemoCommands(c, ca)
     }
 })
 ```
@@ -346,9 +355,9 @@ c.SetServerActiveHandler(func(c *client.Client) {
 
 **This is the trigger point of all master traffic sent by this program itself**
 — nothing is sent between `Connect()` and the confirmation. Without `-demo`
-(the default) nothing is sent at all until an external caller invokes
-`Iec104Bridge.Dispatch` over gRPC (§7); the client is otherwise fully passive
-but keeps receiving and forwarding whatever the outstation reports.
+(the default) nothing is sent at all until the backend writes a `dispatch`
+request on stdin (§7); the client is otherwise fully passive but keeps
+receiving and forwarding whatever the outstation reports.
 
 ### Step 7 — The demo command sequence (`-demo` only)
 
@@ -462,7 +471,7 @@ client.clientHandler()                                     client/handle.go
   │                                               C_SC_* / C_DC_* / C_SE_* /
   │                                               C_BO_* confirmations
   ▼
-masterCall  (call.go)  →  fmt.Printf("[client] …")
+masterCall  (call.go)  →  logf("[client] …")  (stderr)
 ```
 
 ### Step 10 — Callback reference (`masterCall`)
@@ -535,17 +544,17 @@ Because `onConnect` / `onServerActive` fire on **every** (re)connection, the dem
 command sequence (when `-demo` is set) is re-sent after a reconnect — that is
 the documented library behaviour (the comment on `SetOnConnectHandler` warns
 the callback may be called more than once), not a defect in `main.go`. The
-gRPC server is unaffected by IEC 104 reconnects: it keeps running and keeps
-accepting `Dispatch` calls throughout, queuing them onto whatever
-`*client.Client` state currently applies.
+stdio bridge is unaffected by IEC 104 reconnects: it keeps reading stdin and
+keeps answering `dispatch` requests throughout, queuing them onto whatever
+`*client.Client` state currently applies (a request issued while disconnected
+gets an `accepted:false` ack).
 
 ### Step 12 — Shutdown
 
 ```text
-main            : sleeps -duration, then cancel()      (or SIGINT / SIGTERM → cancel())
-                  ← ctx.Done()
-                  grpcServer.GracefulStop()             ← Iec104Bridge stops accepting/serving
-                  c.Close()
+main            : waits for the first of: -duration elapsed, SIGINT / SIGTERM,
+                  stdin EOF (the backend closed the pipe), connect error
+                  c.Close()                             (only if Connect() had succeeded)
 client.Close()  : client104.SendStopDt()   ← U-frame STOPDT (act)
                   client104.Close()        ← cancels running()'s ctx (→ run())
 cs104 run()     : deferred cleanup:
@@ -555,15 +564,20 @@ cs104 run()     : deferred cleanup:
                     conn.Close()           ← unblocks recvLoop / sendLoop
                     wg.Wait()
                     onConnectionLost(sf)   ← no-op here (no handler registered)
-main            : log.Println("client stopped")
-exit
+main            : bridge.stop()            ← flushes queued frames, ends the stdout writer
+                  log.Println("client stopped")
+exit            : code 0 (clean stdin EOF / signal / -duration), 1 on a stdin
+                  read error or a failed Connect() — the backend then restarts it
 ```
 
 `Close()` cancels the context that `running()` stored in `closeCancel`, so the
 dial/reconnect loop exits — but only once that context exists: the call is a
 silent no-op while `closeCancel` is still `nil` (i.e. before `Start()` /
 `running()` has run). In this program `Connect()` always precedes `Close()`, so
-shutdown is complete; the process then exits immediately.
+shutdown is complete (and `Close()` is skipped if `Connect()` never succeeded);
+the process then exits immediately. The backend sends `SIGTERM` after 3 s and
+`SIGKILL` after 5 s if the process is still running, so shutdown must stay
+quick.
 
 ---
 
@@ -623,17 +637,23 @@ and [`architecture.md`](architecture.md) §4.
 | `cast.To*E` / `MarshalBinary` errors | `doSend` value conversion | wrong Go type for the requested ASDU type |
 
 `sendDemoCommands` logs and **continues** with the next command, so one failure
-does not abort the sequence. A failing `Connect()` is fatal
-(`log.Fatalf("connect failed: %v")`).
+does not abort the sequence. A failing `Connect()` is fatal (logged to stderr,
+exit code 1); in bridge mode the outstation is first probed with a plain TCP
+dial (`waitForOutstation`) so a down outstation delays `Connect()` instead of
+killing the bridge.
 
-**Logging is off by default.** The dependency logger (`clog`) is created with
-`has = 0`, i.e. `Debug`/`Warn`/`Error`/`Critical` print nothing. The `-verbose`
-flag is the only switch:
+**Everything is logged to stderr.** In bridge mode stdout carries only NDJSON
+protocol lines, so `main` points `os.Stdout` and the standard logger at stderr
+(`logf` writes there explicitly) and installs a stderr `LogProvider` for the
+library.
+
+**Library logging is off by default.** The dependency logger (`clog`) is created
+with `has = 0`, i.e. `Debug`/`Warn`/`Error`/`Critical` print nothing. The
+`-verbose` flag is the only switch:
 
 ```go
-if *verbose {
-    settings.LogCfg = &client.LogCfg{Enable: true}   // → client104.LogMode(true)
-}
+settings.LogCfg = &client.LogCfg{Enable: *verbose, LogProvider: stderrLogger{…}}
+                                                  // → client104.LogMode(*verbose)
 ```
 
 With `-verbose` the library prints its own prefixed lines, e.g.
@@ -662,8 +682,9 @@ Inbound application callbacks are wrapped in `recover()` by
 # build — run the build from inside the module folder
 cd iec104_client; go build ./...          # writes .\iec104_client\iec104-client.exe
 
-# run (needs an outstation listening on the target port); idles waiting for
-# gRPC Dispatch calls on .\iec104-bridge.sock unless -demo is set
+# run (needs an outstation listening on the target port); runs as the stdio
+# bridge (NDJSON on stdin/stdout) unless -demo is set - normally the MSL5
+# backend spawns it, stdin EOF shuts it down
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -ca 1 -duration 40s
 
 # reinstate the old always-on demo command sequence
@@ -683,7 +704,8 @@ from the repo root:
 ```bash
 ./pull.sh
 ./build.sh                 # -> dist/iec104-client (static linux/arm64, CGO off)
-sudo ./deploy/install.sh   # -> /opt/iec104 + systemd iec104-client[-demo].service
+sudo ./deploy/install.sh   # -> /opt/iec104 + systemd iec104-server / iec104-client-demo
+                           #    (the backend spawns /opt/iec104/iec104-client itself)
 ```
 
 | Flag | Default | Meaning |
@@ -691,15 +713,14 @@ sudo ./deploy/install.sh   # -> /opt/iec104 + systemd iec104-client[-demo].servi
 | `-host` | `127.0.0.1` | outstation host |
 | `-port` | `2404` | outstation port |
 | `-ca` | `1` | ASDU common address used for all sent commands |
-| `-duration` | `0` | run time; `0` = until Ctrl+C / SIGTERM (indefinite) |
-| `-verbose` | `false` | enable the dependency `clog` (frames + decode errors) |
-| `-grpc-socket` | `iec104-bridge.sock` | Unix Domain Socket path the `Iec104Bridge` gRPC server listens on (§7) |
-| `-demo` | `false` | send the built-in demo command sequence once active and skip the gRPC server entirely (no `Dispatch`/`SubscribeEvents`) |
+| `-duration` | `0` | run time; `0` = until Ctrl+C / SIGTERM or, in bridge mode, stdin EOF (indefinite) |
+| `-verbose` | `false` | enable the dependency `clog` (frames + decode errors), written to stderr |
+| `-demo` | `false` | send the built-in demo command sequence once active and skip the stdio bridge entirely (no stdin/stdout protocol) |
 
 The binary is named after the module path (`github.com/alfas/iec104-client`), not
 the folder, hence `iec104-client.exe`.
 
-### Expected output (first seconds, with `-demo`)
+### Expected output (first seconds, with `-demo`; all on stderr)
 
 ```text
 [client] connected to outstation
@@ -727,106 +748,88 @@ the folder, hence `iec104-client.exe`.
 
 ---
 
-## 7. gRPC bridge (`Iec104Bridge`)
+## 7. Stdio bridge (NDJSON)
 
-This section covers `grpcserver.go` and `typemap.go` in file-by-file detail;
+This section covers `bridge.go` and `typemap.go` in file-by-file detail;
 [`architecture.md`](architecture.md) §5 covers the same feature from the
-whole-system perspective.
+whole-system perspective and [`../IEC104_GO_BRIDGE.md`](../IEC104_GO_BRIDGE.md)
+is the authoritative wire-protocol specification.
 
 ### 7.1 Why it exists
 
 The demo command sequence (Step 7, only sent with `-demo`) is useful for
 smoke-testing, but the real consumer of this client is the MSL5 NestJS
 backend, which needs to (a) push its own list of points to read/write and
-(b) receive every resulting IEC 104 frame asynchronously. `Iec104Bridge` is a
-gRPC service, defined in `iec104_client/proto/iec104.proto`, that exposes
-exactly those two operations over a Unix Domain Socket (`-grpc-socket`,
-default `iec104-bridge.sock`) instead of TCP — the backend and this client are
-expected to run as sibling processes on the same host.
+(b) receive every resulting IEC 104 frame asynchronously. Both processes run on
+the same Raspberry Pi, so the backend **spawns this binary as a child process**
+(`IEC104_BRIDGE_BIN` / `IEC104_BRIDGE_ARGS`) and exchanges one JSON object per
+line over its stdin/stdout — no sockets, no code generation. If the process
+exits the backend restarts it with exponential backoff (1 s … 30 s).
 
-### 7.2 The contract (`proto/iec104.proto`)
+### 7.2 The protocol (version 1)
 
-```protobuf
-message Iec104Point {
-  string id = 1;                 // backend-assigned row id, echoed back verbatim
-  Iec104Type type = 2;           // IN / OUT
-  string designation = 3;
-  string channel_id = 4;
-  string channel_name = 5;
-  string asdu_typ = 6;           // e.g. "C_SC_NA_1" — the wire-format mnemonic
-  int32 asdu_high = 7;           // Common Address, split big-endian
-  int32 asdu_low = 8;
-  int32 ioa_high = 9;            // Information Object Address, split big-endian
-  int32 ioa_middle = 10;
-  int32 ioa_low = 11;
-  string typ = 12;                // "Wert" | "Prozent"
-  bool active = 13;
-  string payload_json = 14;       // command value in / decoded value out
-  int64 created_at = 15;
-  int64 updated_at = 16;
-  // 104-IN / 104-OUT specific fields omitted here — see the .proto for the rest
-}
+| Channel | Direction | Content |
+| :--- | :--- | :--- |
+| stdin | backend → Go | `{"op":"dispatch","reqId":"7","type":"OUT","points":[<point>,…]}`; **EOF = clean shutdown** |
+| stdout | Go → backend | `{"op":"ready","version":1}` (first line), `{"op":"ack","reqId":"7","accepted":true,"message":""}` per dispatch, `{"op":"event","point":<point>}` asynchronously. **Nothing else** |
+| stderr | Go → backend log | every log line (forwarded as `[bridge] …`) |
 
-service Iec104Bridge {
-  rpc Dispatch(DispatchRequest) returns (DispatchAck);
-  rpc SubscribeEvents(SubscribeRequest) returns (stream Iec104Point);
-}
+The `point` object (Go type `point` in `bridge.go`) mirrors the backend's
+`Iec104Dto` field for field:
+
+```json
+{"id":"…","type":"OUT","designation":"…","channelId":"…","channelName":"…",
+ "asduTyp":"C_SC_NA_1",
+ "asduHigh":null,"asduLow":1,            // Common Address, split big-endian
+ "ioaHigh":null,"ioaMiddle":null,"ioaLow":5,  // Information Object Address, split big-endian
+ "typ":"Wert","active":true,
+ "payload":{"value":true},               // command value in / {"value":…,"cot":…} out
+ "createdAt":…,"updatedAt":…}
 ```
 
-The Common Address and Information Object Address are split across multiple
-`int32` fields instead of being a single integer because IEC 104's `ParamsWide`
-IOA is **3 octets** — there is no matching scalar protobuf type, and splitting
-big-endian byte-for-byte keeps the bridge free of any assumption about field
-width on either side.
-
-`pb/*.go` is generated from this file and committed (no codegen step at build
-time). Regenerate with:
-
-```powershell
-iec104_client/tools/protoc/bin/protoc.exe -I ../grpc_client_nestjs/proto `
-  --go_out=pb --go_opt=paths=source_relative --go_opt=Miec104.proto=github.com/alfas/iec104-client/pb `
-  --go-grpc_out=pb --go-grpc_opt=paths=source_relative --go-grpc_opt=Miec104.proto=github.com/alfas/iec104-client/pb `
-  iec104.proto
-```
-
-(run from `iec104_client/`, with `protoc-gen-go`/`protoc-gen-go-grpc` on `PATH`).
-The canonical copy of `iec104.proto` lives in the sibling `grpc_client_nestjs`
-repository; the copy under `iec104_client/proto/` here is kept in sync
-manually, not copied automatically.
+The address parts are `*int` in Go: `null`/missing means "not set", and `0` is a
+legitimate value (unlike proto3). The CA and the 3-octet IOA are split across
+several integers because IEC 104's `ParamsWide` IOA has no matching scalar
+type; splitting big-endian byte-for-byte keeps the bridge free of any
+assumption about field width on either side. Fields the bridge does not
+interpret (`createdAt`, `intervall`, `asduRet*`, …) are `json.RawMessage` and
+echoed untouched; unknown fields are ignored.
 
 ### 7.3 `typemap.go` — translating between the wire format and `asdu.TypeID`
 
 `asdu.TypeID.String()` returns a debug format (`"TID<C_IC_NA_1>"`), not the bare
-mnemonic the gRPC contract uses, so this file hand-builds both directions:
+mnemonic the protocol uses, so this file hand-builds both directions:
 
 | Function | Direction | Notes |
 | :--- | :--- | :--- |
-| `typeIDFromName(name string) (asdu.TypeID, bool)` | `asdu_typ` string → `asdu.TypeID` | backs `Dispatch` — unknown names are rejected per-point |
-| `typeNameFromID(id asdu.TypeID) string` | `asdu.TypeID` → `asdu_typ` string | backs every `publishEvent` call; falls back to `id.String()` for types absent from the table (should not happen for standard 101 types) |
-| `commandValueFromPayload(typeId asdu.TypeID, payloadJSON string) (any, error)` | `{"value": ...}` JSON → Go value | mirrors the type switch inside `wendy512/iec104`'s `doSend` (`cast.ToBoolE` for `C_SC_*`, `cast.ToUint8E` for `C_DC_*`/`C_RC_*`, `cast.ToInt16E` for `C_SE_N/TA_1`/`NB_1`/`TB_1`, `cast.ToFloat32E` for `C_SE_NC_1`/`TC_1`, `cast.ToUint32E` for `C_BO_*`) |
+| `typeIDFromName(name string) (asdu.TypeID, bool)` | `asduTyp` string → `asdu.TypeID` | backs `dispatch` — unknown names are rejected per-point |
+| `typeNameFromID(id asdu.TypeID) string` | `asdu.TypeID` → `asduTyp` string | backs every `publishEvent` call; falls back to `id.String()` for types absent from the table (should not happen for standard 101 types) |
+| `commandValueFromPayload(typeId asdu.TypeID, payload json.RawMessage) (any, error)` | `{"value": ...}` JSON → Go value | mirrors the type switch inside `wendy512/iec104`'s `doSend` (`cast.ToBoolE` for `C_SC_*`, `cast.ToUint8E` for `C_DC_*`/`C_RC_*`, `cast.ToInt16E` for `C_SE_N/TA_1`/`NB_1`/`TB_1`, `cast.ToFloat32E` for `C_SE_NC_1`/`TC_1`, `cast.ToUint32E` for `C_BO_*`) |
 
-### 7.4 `grpcserver.go` — the service implementation
+### 7.4 `bridge.go` — the implementation
 
 | Type / function | Role |
 | :--- | :--- |
-| `pointKey{ca, ioa}` | the only stable join key between a dispatched point and a later inbound event — IEC 104 has no concept of the gRPC contract's `id` |
-| `registry` | `sync.RWMutex`-guarded `map[pointKey]*pb.Iec104Point`; `upsert` is called once per dispatched point (even for monitoring types — see below), `lookup` is called from `publishEvent` so replies/spontaneous data can echo back `id`/`designation`/`channel_id`/… |
-| `eventHub` | non-blocking pub/sub: `subscribe()`/`unsubscribe(id)` manage one buffered channel (256) per `SubscribeEvents` caller; `publish(p)` does a non-blocking `select` send to every subscriber and **drops + logs** instead of blocking if a subscriber's buffer is full |
-| `bridgeServer` | holds `client *client.Client`, `hub *eventHub`, `reg *registry`; embeds `pb.UnimplementedIec104BridgeServer` for forward compatibility with new RPCs |
-| `Dispatch(ctx, req) (*pb.DispatchAck, error)` | loops `req.GetPoints()`, calls `dispatchPoint` per point, collects failures into one `DispatchAck{Accepted:false, Message:"..."}` instead of failing the whole RPC on the first error |
-| `dispatchPoint(p *pb.Iec104Point) error` | resolves `asdu_typ` → `typeId`, reassembles CA/IOA, **always** registers the point (`reg.upsert`) even for `M_*` types so later spontaneous data can be correlated, then issues the matching `Send*Cmd` / `SendCmd` call driven purely by `typeId` — not by `DispatchRequest.type` |
-| `SubscribeEvents(req, stream)` | subscribes to the hub, then loops `select { <-stream.Context().Done(): return nil; case p := <-ch: stream.Send(p) }` — one long-lived call per backend process lifetime |
-| `publishEvent(ca, ioa, typeId, cot, value any)` | **nil-safe** (no-op on a `nil *bridgeServer`, so `masterCall` needs no separate guard); builds the outgoing `Iec104Point`, looks up known metadata via `reg.lookup`, marshals `{"value":..., "cot":...}` into `payload_json`, and calls `hub.publish` |
+| `point`, `request`, `readyFrame`, `ackFrame`, `eventFrame` | the JSON shapes above; `reqId` is kept as `json.RawMessage` and echoed verbatim |
+| `pointKey{ca, ioa}` | the only stable join key between a dispatched point and a later inbound event — IEC 104 has no concept of the backend row `id` |
+| `registry` | `sync.RWMutex`-guarded `map[pointKey]*point`; `upsert` is called once per dispatched point (even for monitoring types — see below), `lookup` is called from `publishEvent` so replies/spontaneous data can echo back `id`/`designation`/`channelId`/… |
+| `commander` | the subset of `*client.Client` the bridge drives (`SendCmd`, `SendInterrogationCmd`, …); lets tests substitute a fake outstation client |
+| `bridge` | holds `client commander`, `reg *registry`, `out chan any` (capacity 1024), a `done` channel and the writer's `WaitGroup` |
+| `start(w io.Writer)` | launches the single writer goroutine on `w` (the real stdout) and queues the `ready` frame |
+| `serve(r io.Reader) error` | reads stdin with `bufio.Reader.ReadBytes(''\n'')` — **not** `bufio.Scanner`, whose 64 KB line limit would truncate large batches; handles each line, returns `nil` on EOF |
+| `handleLine` | decodes one request; invalid JSON and unknown `op` are logged to stderr and ignored; `dispatch` produces exactly one `ack` with the same `reqId` |
+| `dispatch` / `dispatchPoint` | loops the points, collects failures into one `accepted:false` ack (instead of failing the batch on the first error); `dispatchPoint` resolves `asduTyp` → `typeId`, reassembles CA/IOA, **always** registers the point (`reg.upsert`) even for `M_*` types so later spontaneous data can be correlated, then issues the matching `Send*Cmd` / `SendCmd` call driven purely by `typeId` — not by the batch-level `type` |
+| `publishEvent(ca, ioa, typeId, cot, value any)` | **nil-safe** (no-op on a `nil *bridge`, so `masterCall` needs no separate guard); builds the outgoing `point`, looks up known metadata via `reg.lookup` (for unknown points `type` is inferred: `M_*` → `IN`, `C_*` → `OUT`), marshals `{"value":..., "cot":...}` into `payload`, and does a **non-blocking** send into `out` |
+| `writeLoop` | the only goroutine that touches stdout: marshals each frame, appends `\n`, batches whatever is queued into one flush; on `stop()` it drains the queue before returning |
 | `commonAddrFromPoint` / `infoObjAddrFromPoint` | reassemble the split CA/IOA fields, big-endian, mirroring the split done by `publishEvent` |
-| `startGRPCServer(socketPath string, srv *bridgeServer) (*grpc.Server, error)` | removes a stale socket file if present, `net.Listen("unix", socketPath)`, registers `srv`, serves on its own goroutine; the returned `*grpc.Server` is `GracefulStop`'d in `main.go`'s shutdown path (Step 12, §3) |
 
-### 7.5 Dispatch → command, end to end
+### 7.5 `dispatch` → command, end to end
 
 ```text
-backend  Dispatch({points: [{asdu_typ:"C_SC_NA_1", asdu_high, asdu_low, ioa_*, payload_json:'{"value":true}'}]})
+backend  {"op":"dispatch","reqId":"7","type":"OUT","points":[{"asduTyp":"C_SC_NA_1","asduLow":1,"ioaLow":5,"payload":{"value":true}}]}
   │
   ▼
-bridgeServer.Dispatch                                    grpcserver.go
+bridge.serve → handleLine → dispatch                     bridge.go
   │  for each point → dispatchPoint(p)
   ▼
 dispatchPoint
@@ -834,14 +837,19 @@ dispatchPoint
   │  ② commonAddrFromPoint / infoObjAddrFromPoint → ca, ioa
   │  ③ reg.upsert(ca, ioa, p)                                          ← for later correlation
   │  ④ commandValueFromPayload(C_SC_NA_1, `{"value":true}`) → true     typemap.go
-  │  ⑤ s.client.SendCmd(uint16(ca), asdu.C_SC_NA_1, ioa, true)
+  │  ⑤ b.client.SendCmd(uint16(ca), asdu.C_SC_NA_1, ioa, true)
   ▼
 … same outbound path as the demo sequence (§3 Step 8) …
   ▼
 TCP → outstation
+
+ack → out channel → writer → stdout:  {"op":"ack","reqId":"7","accepted":true,"message":""}
 ```
 
-### 7.6 Inbound event → SubscribeEvents, end to end
+The `ack` is sent once the batch is **accepted/queued**, not when the outstation
+has answered.
+
+### 7.6 Inbound event → `event` frame, end to end
 
 ```text
 TCP → outstation reply (e.g. C_SC_NA_1 ActivationCon)
@@ -852,45 +860,57 @@ masterCall.onCommandReply                                            call.go
   │  sc := packet.GetSingleCmd()
   │  m.bridge.publishEvent(packet.CommonAddr, sc.Ioa, packet.Type, packet.Coa, sc)
   ▼
-bridgeServer.publishEvent                                            grpcserver.go
+bridge.publishEvent                                                  bridge.go
   │  ① typeNameFromID(C_SC_NA_1) → "C_SC_NA_1"                        typemap.go
-  │  ② reg.lookup(ca, ioa) → the Iec104Point dispatched in §7.5, reused for id/designation/…
-  │  ③ json.Marshal({"value": sc, "cot": "COT<ActivationCon>"}) → payload_json
-  │  ④ hub.publish(p)  ← non-blocking fan-out to every subscriber
+  │  ② reg.lookup(ca, ioa) → the point dispatched in §7.5, reused for id/designation/…
+  │  ③ json.Marshal({"value": sc, "cot": "COT<ActivationCon>"}) → payload
+  │  ④ non-blocking send into the out channel
   ▼
-bridgeServer.SubscribeEvents (one goroutine per backend connection)
-  │  case p := <-ch: stream.Send(p)
+bridge.writeLoop (single goroutine, owns stdout)
+  │  json.Marshal(eventFrame) + '\n'
   ▼
-backend receives the correlated Iec104Point over the gRPC stream
+backend reads {"op":"event","point":{…}} from the child's stdout
 ```
 
 ### 7.7 Concurrency & safety notes
 
 - `publishEvent` is called from **every** `masterCall` callback, which all run
-  on the IEC 104 library's single `handlerLoop` goroutine (§2.3). `eventHub.publish`
-  is therefore required to be non-blocking — a stuck or slow gRPC subscriber
-  must never stall protocol processing. A full subscriber buffer drops the
-  frame and logs `[grpc] subscriber %d event buffer full, dropping frame`
-  rather than blocking.
-- `registry` and `eventHub` each guard their state with their own
-  `sync.RWMutex`; `bridgeServer` itself holds no additional lock.
-- `dispatchPoint` runs on a gRPC-server goroutine (one per concurrent RPC),
-  fully independent from `handlerLoop` — `client.SendCmd` is documented as safe
-  to call from any goroutine (§2.3).
-- `publishEvent` is nil-safe so `masterCall{bridge: nil}` (e.g. in a unit test
-  that doesn't need gRPC) works without a separate guard at every call site.
+  on the IEC 104 library's single `handlerLoop` goroutine (§2.3). The channel
+  send is therefore required to be non-blocking — a stuck or slow stdout
+  reader must never stall protocol processing. When the buffer is full the
+  frame is dropped and `[bridge] event buffer full, dropping frame` is logged
+  to stderr rather than blocking.
+- Exactly one goroutine writes stdout, so frames never interleave; a frame is
+  always one `json.Marshal` result plus `\n`.
+- `registry` guards its state with its own `sync.RWMutex`; `bridge` itself holds
+  no additional lock.
+- `dispatchPoint` runs on the stdin-reader goroutine, fully independent from
+  `handlerLoop` — `client.SendCmd` is documented as safe to call from any
+  goroutine (§2.3). Acks are produced there too, so they may block briefly on
+  the writer but never stall `handlerLoop`.
+- **stdout is protocol only.** `main` assigns `os.Stdout = os.Stderr` (and keeps
+  the original file for the writer), the standard `log` package already writes
+  to stderr, and the library logger gets a stderr `LogProvider`. A stray line on
+  stdout would be logged by the backend as a malformed bridge line and ignored,
+  but must never be relied on.
+- `publishEvent` is nil-safe so `masterCall{bridge: nil}` (`-demo`, or a unit
+  test that doesn't need the bridge) works without a separate guard at every
+  call site.
+- Tests (`bridge_test.go`) drive a `bridge` with `io.Pipe` as stdin/stdout and a
+  fake `commander`: `ready`, `dispatch` → `ack` (accepted and rejected), events
+  (known and unknown points), a batch larger than 64 KB, malformed lines, EOF →
+  clean `serve` return, a full buffer never blocking `publishEvent`, and that
+  every stdout line is valid JSON.
 
----
-
-## 8. Extension points
+---## 8. Extension points
 
 | Goal | Where to change |
 | :--- | :--- |
 | Send a new/another command from the demo | add an entry to the `cmds` slice in `sendDemoCommands` (`main.go`); if the ASDU type has no wrapper yet, use the generic `c.SendCmd(ca, typeId, ioa, value)` |
 | React to a new monitoring type | add a `case` to the `switch client.GetDataType(packet.Type)` block in `OnASDU` (`call.go`) |
 | React to a new command confirmation | add a `case` in `onCommandReply` (`call.go`) |
-| Support a new `asdu_typ` over gRPC | add it to `typeIDByName` (`typemap.go`); if it's a command type, also add a case to `commandValueFromPayload` and to the `dispatchPoint` type switch (`grpcserver.go`) |
-| Add a new gRPC RPC | extend `proto/iec104.proto`, regenerate `pb/*.go` (§7.2), implement the method on `bridgeServer` |
+| Support a new `asduTyp` over the bridge | add it to `typeIDByName` (`typemap.go`); if it's a command type, also add a case to `commandValueFromPayload` and to the `dispatchPoint` type switch (`bridge.go`) |
+| Add a new bridge message (`op`) | add a frame type and a `case` in `handleLine` (`bridge.go`), extend [`../IEC104_GO_BRIDGE.md`](../IEC104_GO_BRIDGE.md) and bump `protocolVersion` if the backend must know |
 | Change defaults (t₀–t₃, k, w, TLS, 2-byte IOA) | build a `cs104.Config` / pick `asdu.ParamsStandard` and assign `settings.Cfg104` / `settings.Params` before `client.New` |
 | Disable auto-reconnect | set `settings.AutoConnect = false` |
 | Handle connection loss | `c.SetConnectionLostHandler(func(_ *client.Client) { … })` (not registered in this demo) |
@@ -908,12 +928,11 @@ safe; but the same rule applies if a `masterCall` callback is ever made to reply
 
 **Application code**
 
-- `iec104_client/main.go` — flags, settings, lifecycle, starts the gRPC server, `sendDemoCommands`
+- `iec104_client/main.go` — flags, settings, lifecycle, stdout/stderr split, starts the stdio bridge, `sendDemoCommands`
 - `iec104_client/call.go` — `masterCall`, `onCommandReply`, `bridge.publishEvent` forwarding
-- `iec104_client/grpcserver.go` — `bridgeServer`, `registry`, `eventHub`, `Dispatch`, `SubscribeEvents`, `startGRPCServer`
-- `iec104_client/typemap.go` — `asdu_typ` ↔ `asdu.TypeID` tables, `commandValueFromPayload`
-- `iec104_client/proto/iec104.proto` — the `Iec104Bridge` gRPC contract
-- `iec104_client/pb/*.go` — generated protobuf/gRPC code (committed)
+- `iec104_client/bridge.go` — `bridge`, `point`, `registry`, `serve`, `dispatch`, `publishEvent`, `writeLoop`
+- `iec104_client/bridge_test.go` — pipe-based protocol tests
+- `iec104_client/typemap.go` — `asduTyp` ↔ `asdu.TypeID` tables, `commandValueFromPayload`
 
 **Upstream packages (v1.0.4 / v1.2.5)**
 
@@ -932,7 +951,8 @@ safe; but the same rule applies if a `masterCall` callback is ever made to reply
 **Repository documents**
 
 - [`../README.md`](../README.md) — build/run, verified run log, library bugs
-- [`architecture.md`](architecture.md) — whole-system architecture and workflow, gRPC bridge overview (§5)
+- [`architecture.md`](architecture.md) — whole-system architecture and workflow, stdio bridge overview (§5)
+- [`../IEC104_GO_BRIDGE.md`](../IEC104_GO_BRIDGE.md) — the NDJSON wire protocol between the backend and this client
 - [`../iec_60870_5_104_bug_report.md`](../iec_60870_5_104_bug_report.md) —
   Bug 1 (`Get*Cmd()` + `SendReplyMirror`), Bug 2 (GI sequence), Bug 3
   (`infoObjSize` 58–64)

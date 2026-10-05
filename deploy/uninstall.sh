@@ -8,6 +8,8 @@ set -euo pipefail
 
 PREFIX="/opt/iec104"
 UNITS_DIR="/etc/systemd/system"
+# iec104-client.service is legacy (the backend spawns the client now); listed so
+# an older deployment is cleaned up too.
 UNITS=("iec104-server.service" "iec104-client.service" "iec104-client-demo.service")
 
 if [[ "$(id -u)" -ne 0 ]]; then

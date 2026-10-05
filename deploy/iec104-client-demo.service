@@ -1,14 +1,12 @@
 [Unit]
-Description=IEC 60870-5-104 master (client) - built-in demo command sequence (no gRPC)
+Description=IEC 60870-5-104 master (client) - built-in demo command sequence (standalone, no stdio bridge)
 Documentation=https://github.com/Mhd25OrCode/IEC104_Go
-# Same ordering/dependency as the gRPC client unit. "Wants" (not "Requires")
-# keeps this unit up across an outstation restart.
+# Start after the outstation. "Wants" (not "Requires") keeps this unit up across
+# an outstation restart.
 After=network-online.target iec104-server.service
 Wants=network-online.target iec104-server.service
-# Only one master may own the outstation link: starting this unit stops the
-# gRPC client, and starting the gRPC client stops this one (mirrored
-# Conflicts= in iec104-client.service).
-Conflicts=iec104-client.service
+# Only one master may own the outstation link: stop the MSL5 backend (which
+# spawns iec104-client as its stdio bridge) before starting this demo.
 # Deliberately NO [Install] section: this is a manual unit, so "systemctl
 # enable" refuses it and "systemctl preset-all" can never start it at boot.
 
@@ -17,10 +15,6 @@ Type=simple
 User=iec104
 Group=iec104
 WorkingDirectory=/opt/iec104
-# -demo never creates the gRPC socket (main.go skips startGRPCServer), so
-# /run/msl5 is unused here; declared only to keep both client units symmetric.
-RuntimeDirectory=msl5
-RuntimeDirectoryMode=0755
 # -duration 0 = run until "systemctl stop". 0 is already the client's flag
 # default (run until Ctrl+C/SIGTERM), but the unit states it explicitly so the
 # intent survives any future change to that default.

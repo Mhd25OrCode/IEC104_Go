@@ -16,11 +16,11 @@ iec104_server/   outstation ("slave")
   handler.go     CommandHandler + process image + periodic/spontaneous reporting
   confirm.go     fresh-ASDU confirmation builders (the bug workaround)
 iec104_client/   master ("client")
-  main.go        connection lifecycle, optional gRPC bridge server (-demo skips it), -demo command sequence
-  call.go        ASDUCall implementation (all replies & data), forwards every event to the gRPC bridge
-  grpcserver.go  Iec104Bridge gRPC service (Dispatch / SubscribeEvents) over a Unix Domain Socket
-  typemap.go     asdu_typ <-> asdu.TypeID conversion for the gRPC contract
-  proto/         Iec104Bridge .proto contract; pb/ holds the generated code
+  main.go        connection lifecycle, stdio bridge wiring (-demo skips it), -demo command sequence
+  call.go        ASDUCall implementation (all replies & data), forwards every event to the bridge
+  bridge.go      NDJSON stdin/stdout bridge (ready / dispatch -> ack / event), see IEC104_GO_BRIDGE.md
+  bridge_test.go pipe-based round-trip tests of the bridge protocol
+  typemap.go     asduTyp <-> asdu.TypeID conversion for the bridge protocol
 build.sh         cross-build static linux/arm64 binaries into dist/ (CGO off)
 pull.sh          token-authenticated fast-forward pull from GitHub (Raspberry Pi)
 deploy/          systemd units + install.sh / uninstall.sh for the Pi
@@ -29,7 +29,7 @@ docs/            architecture.md, iec104_client_architecture.md
 
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/iec104_client_architecture.md`](docs/iec104_client_architecture.md) §7
-for the full gRPC bridge design.
+for the bridge design and [`IEC104_GO_BRIDGE.md`](IEC104_GO_BRIDGE.md) for the wire protocol.
 
 ## Build & run
 
@@ -41,11 +41,13 @@ cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 # terminal 1 - outstation (runs until Ctrl+C, or pass -duration)
 .\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
 
-# terminal 2 - master: by default it starts the gRPC bridge and idles waiting for
-# Dispatch calls; with -demo it skips gRPC entirely and instead sends the built-in
-# demo command sequence once the outstation confirms STARTDT
-.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s          # gRPC bridge mode
-.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -demo -duration 40s   # demo only, no gRPC
+# terminal 2 - master: by default it runs as the stdio bridge, reading NDJSON
+# "dispatch" requests on stdin and writing "ready"/"ack"/"event" lines to stdout
+# (normally the MSL5 backend spawns it; stdin EOF shuts it down). With -demo it
+# skips the bridge entirely and instead sends the built-in demo command
+# sequence once the outstation confirms STARTDT
+.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s          # stdio bridge mode
+.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -demo -duration 40s   # demo only, no bridge
 ```
 
 The executable names come from the module paths (`github.com/alfas/iec104-server`
@@ -69,13 +71,12 @@ $srv.WaitForExit()
 
 Flags: `-host`, `-port`, `-ca` (common address, default 1),
 server: `-period`/`-spontaneous` (reporting intervals),
-both: `-duration` (how long to run; **default `0`** = run until Ctrl+C/SIGTERM),
+both: `-duration` (how long to run; **default `0`** = run until Ctrl+C/SIGTERM, or, in bridge mode, until stdin closes),
 both: `-verbose` (enable the go-iecp5 frame/decode log, off by default).
-Client only: `-demo` (skip the gRPC bridge entirely and instead send the
-built-in demo command sequence once the outstation is active, off by default;
-the `-grpc-socket` path is ignored when it is set), `-grpc-socket` (Unix
-Domain Socket path for the `Iec104Bridge` gRPC server, default
-`iec104-bridge.sock`).
+Client only: `-demo` (skip the stdio bridge entirely and instead send the
+built-in demo command sequence once the outstation is active, off by default).
+In bridge mode **stdout carries only protocol lines**; every log/diagnostic
+(including the `-verbose` library log) goes to stderr.
 
 ## Pull / update (`pull.sh`)
 
@@ -133,8 +134,9 @@ supported and fails with `Exec format error` (verify with `uname -m`, which
 must print `aarch64`).
 
 Both programs run on the same board: the outstation on `0.0.0.0:2404` and the
-master (with its `Iec104Bridge` gRPC server) connecting to it over loopback and
-exposing the socket at `/run/msl5/iec104-bridge.sock`.
+master connecting to it over loopback. The master is not a systemd service: the
+MSL5 backend spawns `/opt/iec104/iec104-client` as a child process
+(`IEC104_BRIDGE_BIN`) and talks to it over stdin/stdout (NDJSON).
 
 ### End-to-end workflow (pull → build → install)
 
@@ -189,33 +191,33 @@ sudo ./deploy/install.sh
 ```
 
 The installer creates an `iec104` system user, copies the binaries to
-`/opt/iec104/`, and installs three units into `/etc/systemd/system/`:
-`deploy/iec104-server.service`, `deploy/iec104-client.service` (the gRPC
-master) and `deploy/iec104-client-demo.service` (the `-demo` master). It then
-runs `daemon-reload` and `enable --now` on the first two only - the demo unit
-is installed for manual use and is never enabled (see below).
+`/opt/iec104/`, and installs two units into `/etc/systemd/system/`:
+`deploy/iec104-server.service` and `deploy/iec104-client-demo.service` (the
+`-demo` master). It then runs `daemon-reload` and `enable --now` on the server
+unit only - the demo unit is installed for manual use and is never enabled (see
+below). There is deliberately **no** unit for the bridge client: the backend
+spawns it. A leftover `iec104-client.service` from an older (gRPC) deployment is
+removed by the installer.
 
 ```bash
-systemctl status iec104-server iec104-client
-journalctl -u iec104-server -u iec104-client -f
+systemctl status iec104-server
+journalctl -u iec104-server -f
 ```
 
-### Switching between gRPC bridge and demo mode
+### Bridge mode vs. demo mode
 
-`iec104-client.service` (gRPC bridge) and `iec104-client-demo.service`
-(built-in `-demo` command sequence, no gRPC) are two ordinary units - not a
-systemd template. `systemctl start` can never forward arguments to the process
-(`systemctl start iec104-client -demo` makes systemctl parse `-demo` itself and
-fail with `invalid option -- 'd'`), and a template instance cannot inject a
-leading `-demo` either, because a leading `-` on a word in `ExecStart=` is
-systemd's own ignore-failure prefix.
+The bridge client (`iec104-client` without flags other than host/port) is
+launched by the MSL5 backend, never by systemd. Set `IEC104_BRIDGE_BIN=/opt/iec104/iec104-client`
+and, if needed, `IEC104_BRIDGE_ARGS` (e.g. `["-host","127.0.0.1","-port","2404"]`);
+the backend restarts it with backoff if it exits, and its stderr appears in the
+backend log prefixed with `[bridge]`.
 
-Both units declare a mirrored `Conflicts=`, so they are mutually exclusive and
-switching modes is a plain `start`:
+`iec104-client-demo.service` (built-in `-demo` command sequence, no bridge) is
+the only client unit. Only one master may own the outstation link, so **stop the
+backend (or disable its bridge) before starting it**:
 
 ```bash
-sudo systemctl start iec104-client-demo    # demo mode (stops iec104-client)
-sudo systemctl start iec104-client         # gRPC mode (stops the demo unit)
+sudo systemctl start iec104-client-demo
 sudo systemctl stop  iec104-client-demo
 journalctl -u iec104-client-demo -f
 ```
@@ -226,16 +228,8 @@ at boot. It runs with an explicit `-duration 0` — `0` is now the flag default
 (run until stopped), but the unit states it so the intent survives any future
 default change — so it stays up until you stop it, and uses
 `Restart=on-failure` instead of `Restart=always` so neither a clean exit nor a
-crash loop can replay the demo. Because `-demo` skips the gRPC bridge entirely (`main.go`
-never calls `startGRPCServer`), no `/run/msl5/iec104-bridge.sock` exists while
-it runs - which is precisely why starting it stops the gRPC unit.
-
-The client unit sets `RuntimeDirectory=msl5`, so systemd creates and owns
-`/run/msl5/` (and removes it on stop) for the gRPC socket. If the NestJS backend
-runs as a different user, add its group via `SupplementaryGroups=` (and/or relax
-the socket `UMask`) in `deploy/iec104-client.service`; both lines are present,
-commented out. Port 2404 is unprivileged, so the services run as the non-root
-`iec104` user.
+crash loop can replay the demo. Port 2404 is unprivileged, so the services run as
+the non-root `iec104` user.
 
 ### Smoke test (binaries directly, no systemd)
 
@@ -250,8 +244,8 @@ commented out. Port 2404 is unprivileged, so the services run as the non-root
 sudo ./deploy/uninstall.sh
 ```
 
-Stops and disables both units, removes the unit files, and deletes
-`/opt/iec104/`.
+Stops and disables the units (including a legacy `iec104-client.service`),
+removes the unit files, and deletes `/opt/iec104/`.
 
 ## Protocol exchanges exercised
 

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 #
 # install.sh - deploy the built IEC 104 binaries + systemd units on the
-# Raspberry Pi CM5 (Debian arm64). Run as root, after ./build.sh:
+# Raspberry Pi CM5 (Debian arm64). Run as root, after ./build.sh.
+#
+# iec104-client is NOT a systemd service: the MSL5 backend spawns it as a child
+# process and talks to it over stdin/stdout (NDJSON). Point the backend at
+# /opt/iec104/iec104-client via IEC104_BRIDGE_BIN. Usage:
 #
 #   ./build.sh
 #   sudo ./deploy/install.sh
@@ -11,7 +15,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="/opt/iec104"
 SERVICE_USER="iec104"
 UNITS_DIR="/etc/systemd/system"
-UNITS=("iec104-server.service" "iec104-client.service" "iec104-client-demo.service")
+UNITS=("iec104-server.service" "iec104-client-demo.service")
 
 if [[ "$(id -u)" -ne 0 ]]; then
 	echo "error: run as root (sudo $0)" >&2
@@ -40,17 +44,22 @@ for u in "${UNITS[@]}"; do
 	install -m 0644 "$ROOT/deploy/$u" "$UNITS_DIR/$u"
 done
 
+echo ">> removing the legacy iec104-client.service (the backend spawns the client now)"
+systemctl disable --now iec104-client.service 2>/dev/null || true
+rm -f "$UNITS_DIR/iec104-client.service"
+
 echo ">> reloading systemd and enabling services"
 systemctl daemon-reload
-# Only the outstation and the gRPC master are enabled at boot. The demo unit
+# Only the outstation is enabled at boot. The demo unit
 # is manual only (it has no [Install] section), so make sure an earlier deploy
 # cannot have left it enabled, and leave it stopped.
-systemctl enable --now iec104-server.service iec104-client.service
+systemctl enable --now iec104-server.service
 systemctl disable --now iec104-client-demo.service 2>/dev/null || true
 
 echo ">> status:"
-systemctl --no-pager --full status iec104-server.service iec104-client.service || true
+systemctl --no-pager --full status iec104-server.service || true
 
 echo
-echo "done. follow logs with: journalctl -u iec104-server -u iec104-client -f"
-echo "demo mode: sudo systemctl start iec104-client-demo   (stops iec104-client)"
+echo "done. follow outstation logs with: journalctl -u iec104-server -f"
+echo "backend bridge: set IEC104_BRIDGE_BIN=$PREFIX/iec104-client (the backend spawns it; its stderr appears in the backend log)"
+echo "demo mode: sudo systemctl start iec104-client-demo   (stop the backend first: only one master per outstation)"
