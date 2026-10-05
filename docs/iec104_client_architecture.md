@@ -195,12 +195,16 @@ ca       := flag.Uint("ca", 1, "ASDU common address")
 duration := flag.Duration("duration", 0, "how long to run (0 = until stdin closes or Ctrl+C/SIGTERM)")
 verbose  := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging…, written to stderr")
 demo     := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active and skip the stdio bridge entirely (no stdin/stdout protocol)")
+showVersion := flag.Bool("version", false, "print build/version info and exit (does not start the bridge)")
 ```
 
 `ca` is converted to `uint16` only at the call site of `sendDemoCommands`; the
 rest of the file uses the pointer values directly. `-demo` defaults to `false`:
 without it, the client sends nothing on its own and simply waits for `dispatch`
-requests on stdin (§7) once the outstation is active.
+requests on stdin (§7) once the outstation is active. `-version` prints a single
+line (module path, `vcs.revision`, `bridge=ndjson/<n>`) and returns before
+stdout is redirected to stderr, so a deployed binary can be identified — and told
+apart from an old gRPC build — without starting the bridge.
 
 ### Step 2 — Build `client.Settings`
 

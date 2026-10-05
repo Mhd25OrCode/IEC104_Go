@@ -158,3 +158,9 @@ prints `ready`, so the backend kills and restarts it every 10 s and logs
 `no "ready" from bridge`. Where the binary lives (inside the backend release,
 or at a fixed path outside it) is a deployment decision, not part of the
 protocol.
+
+To tell a stale install apart, run `iec104-client -version`: a bridge build
+prints the revision stamped by `build.sh` plus `bridge=ndjson/1`, whereas the
+old gRPC client has no `-version` flag and links `google.golang.org/grpc`.
+`deploy/install.sh` also prints the `sha256sum` of what it installed and warns
+when the client carries no NDJSON bridge code.

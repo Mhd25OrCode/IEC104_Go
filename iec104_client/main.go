@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"sync/atomic"
 	"syscall"
@@ -24,7 +26,15 @@ func main() {
 	duration := flag.Duration("duration", 0, "how long to run (0 = until stdin closes or Ctrl+C/SIGTERM)")
 	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors), written to stderr")
 	demo := flag.Bool("demo", false, "send the built-in demo command sequence once the outstation is active and skip the stdio bridge entirely (no stdin/stdout protocol)")
+	showVersion := flag.Bool("version", false, "print build/version info and exit (does not start the bridge)")
 	flag.Parse()
+
+	// -version must answer on the real stdout and exit before stdout is
+	// redirected to stderr for the protocol stream below.
+	if *showVersion {
+		fmt.Println(buildVersion())
+		return
+	}
 
 	// stdout carries only NDJSON protocol frames (see IEC104_GO_BRIDGE.md).
 	// Keep the real stdout for the bridge and point os.Stdout (and the standard
@@ -34,6 +44,34 @@ func main() {
 	log.SetOutput(os.Stderr)
 
 	os.Exit(run(*host, *port, uint16(*ca), *duration, *verbose, *demo, os.Stdin, protoOut))
+}
+
+// buildVersion is the single line printed by -version. It reports the module
+// path, the VCS revision/branch stamp the Go toolchain embeds at build time
+// (build.sh builds with -trimpath) and the NDJSON bridge protocol version, so a
+// deployed binary can be told apart from an older one. A pre-bridge (gRPC) build
+// has no bridge code at all and links google.golang.org/grpc, so it never prints
+// the "ready" frame the MSL5 backend waits for.
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return fmt.Sprintf("iec104-client (no build info) bridge=ndjson/%d", protocolVersion)
+	}
+	rev, built, modified := "unknown", "unknown", "false"
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.time":
+			built = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		}
+	}
+	return fmt.Sprintf(
+		"iec104-client module=%s version=%s revision=%s built=%s modified=%s go=%s bridge=ndjson/%d",
+		info.Main.Path, info.Main.Version, rev, built, modified, info.GoVersion, protocolVersion,
+	)
 }
 
 // stderrLogger is the go-iecp5 LogProvider; the library's default logger

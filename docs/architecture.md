@@ -55,7 +55,7 @@ document only covers how it fits into the whole system.
 | `iec104_server/main.go` | Flags (`-host`, `-port`, `-ca`, `-period`, `-spontaneous`, `-duration`), listener lifecycle, graceful shutdown on `-duration` or Ctrl+C/SIGTERM |
 | `iec104_server/handler.go` | `station` — implements `server.CommandHandler`: process image, general/counter interrogation, read/clock-sync/reset/delay/test handlers, control-command dispatch, background reporting goroutines |
 | `iec104_server/confirm.go` | Confirmation builders that construct **fresh ASDUs** — the `SendReplyMirror()` bug workaround (see §4) |
-| `iec104_client/main.go` | Flags (`-host`, `-port`, `-ca`, `-duration`, `-verbose`, `-demo`), connection settings (`AutoConnect`), keeps stdout for protocol frames only (everything else goes to stderr), starts the stdio bridge, shuts down on stdin EOF / SIGTERM, optional demo command sequence fired after STARTDT (only with `-demo`) |
+| `iec104_client/main.go` | Flags (`-host`, `-port`, `-ca`, `-duration`, `-verbose`, `-demo`, `-version`), connection settings (`AutoConnect`), keeps stdout for protocol frames only (everything else goes to stderr), starts the stdio bridge, shuts down on stdin EOF / SIGTERM, optional demo command sequence fired after STARTDT (only with `-demo`) |
 | `iec104_client/call.go` | `masterCall` — implements `client.ASDUCall`: logs every reply, confirmation and monitoring value, and forwards each one to `bridge.publishEvent` |
 | `iec104_client/bridge.go` | `bridge` — the NDJSON stdio protocol (`ready`, `dispatch` → `ack`, `event`); `point` is the JSON form of the backend's `Iec104Dto`; `registry` correlates `(CommonAddr, InfoObjAddr)` to the last dispatched point; one writer goroutine owns stdout and drains a single non-blocking event channel |
 | `iec104_client/bridge_test.go` | Pipe-based round-trip tests (`ready`, `dispatch` → `ack`, events, EOF shutdown, stdout contains only JSON lines) |
@@ -268,6 +268,10 @@ cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
 # add -verbose to either program to print the raw cs104 frame/decode log;
 # that is how the silent C_BO_TA_1 drop (Bug 3, §4) becomes visible
 .\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s -verbose
+
+# print the build/VCS revision the binary was built from (revision=…, plus
+# bridge=ndjson/<n>); an old gRPC-only client has no -version flag at all
+.\iec104_client\iec104-client.exe -version
 ```
 
 On the Raspberry Pi CM4/CM5 (Debian arm64) the same sources are pulled, built and

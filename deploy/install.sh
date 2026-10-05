@@ -39,6 +39,20 @@ install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$PREFIX"
 install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$ROOT/dist/iec104-server" "$PREFIX/iec104-server"
 install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$ROOT/dist/iec104-client" "$PREFIX/iec104-client"
 
+echo ">> installed artifacts (compare with $ROOT/dist/ to spot a stale install):"
+if command -v sha256sum >/dev/null 2>&1; then
+	sha256sum "$PREFIX/iec104-server" "$PREFIX/iec104-client"
+fi
+
+# Sanity check: the bridge client must carry the NDJSON bridge code. A binary
+# built before the bridge landed (commit f45d1f8) is the old gRPC client, never
+# prints the {"op":"ready","version":1} frame and makes the MSL5 backend report
+# "IEC 104 bridge is not running" on every dispatch.
+if ! grep -aq 'unknown asduTyp' "$PREFIX/iec104-client"; then
+	echo "warning: $PREFIX/iec104-client has no NDJSON bridge code -" >&2
+	echo "         rebuild with ./build.sh at f45d1f8 or later, then re-run this installer" >&2
+fi
+
 echo ">> installing systemd units to $UNITS_DIR"
 for u in "${UNITS[@]}"; do
 	install -m 0644 "$ROOT/deploy/$u" "$UNITS_DIR/$u"

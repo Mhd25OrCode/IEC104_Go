@@ -75,6 +75,9 @@ both: `-duration` (how long to run; **default `0`** = run until Ctrl+C/SIGTERM, 
 both: `-verbose` (enable the go-iecp5 frame/decode log, off by default).
 Client only: `-demo` (skip the stdio bridge entirely and instead send the
 built-in demo command sequence once the outstation is active, off by default).
+Client only: `-version` (print the module path, VCS revision and bridge protocol
+version — e.g. `bridge=ndjson/1` — then exit; use it to confirm which build is
+installed).
 In bridge mode **stdout carries only protocol lines**; every log/diagnostic
 (including the `-verbose` library log) goes to stderr.
 
@@ -146,6 +149,17 @@ cd ~/IEC104_Go
 ./build.sh                 # 2) build  - dist/iec104-{server,client} (static arm64)
 sudo ./deploy/install.sh   # 3) run    - /opt/iec104 + systemd enable --now
 ```
+
+> **Run all three after every `pull.sh`.** `build.sh` only refreshes `dist/`; it
+> never touches `/opt/iec104/`, which is the path the MSL5 backend spawns
+> (`IEC104_BRIDGE_BIN`). Skipping `install.sh` therefore leaves the backend on a
+> stale binary — e.g. a pre-bridge (gRPC) client that never prints
+> `{"op":"ready","version":1}`, which the backend reports as
+> `IEC 104 bridge is not running` on every dispatch. `install.sh` prints the
+> `sha256sum` of what it installed (compare it with
+> `sha256sum dist/iec104-client`) and warns if the client carries no NDJSON
+> bridge code; `/opt/iec104/iec104-client -version` must show the current
+> revision and `bridge=ndjson/1`.
 
 ### Prerequisites
 
