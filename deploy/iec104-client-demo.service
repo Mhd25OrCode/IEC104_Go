@@ -1,12 +1,12 @@
 [Unit]
-Description=IEC 60870-5-104 master (client) - built-in demo command sequence (standalone, no stdio bridge)
+Description=IEC 60870-5-104 master (client) - built-in demo command sequence (standalone)
 Documentation=https://github.com/Mhd25OrCode/IEC104_Go
 # Start after the outstation. "Wants" (not "Requires") keeps this unit up across
 # an outstation restart.
 After=network-online.target iec104-server.service
 Wants=network-online.target iec104-server.service
-# Only one master may own the outstation link: stop the MSL5 backend (which
-# spawns iec104-client as its stdio bridge) before starting this demo.
+# Only one master may own the outstation link: stop any other master
+# before starting this demo.
 # Deliberately NO [Install] section: this is a manual unit, so "systemctl
 # enable" refuses it and "systemctl preset-all" can never start it at boot.
 

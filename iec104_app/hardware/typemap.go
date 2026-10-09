@@ -1,16 +1,12 @@
-package main
+package hardware
 
 import (
-	"encoding/json"
-	"fmt"
 	"strings"
 
-	"github.com/spf13/cast"
 	"github.com/wendy512/go-iecp5/asdu"
 )
 
-// typeIDByName converts the bridge protocol's point.asduTyp string (see
-// IEC104_GO_BRIDGE.md) into the wendy512/go-iecp5 asdu.TypeID this client
+// typeIDByName converts the ASDU type mnemonic into the wendy512/go-iecp5 asdu.TypeID this client
 // sends/decodes. Names match the companion standard 101 mnemonics
 // exposed by the asdu package (verified via `go doc asdu.TypeID`).
 var typeIDByName = map[string]asdu.TypeID{
@@ -71,9 +67,9 @@ var typeIDByName = map[string]asdu.TypeID{
 	"C_TS_TA_1": asdu.C_TS_TA_1,
 }
 
-// typeIDFromName resolves a bridge point.asduTyp string to its asdu.TypeID.
+// typeIDFromName resolves an ASDU type mnemonic string to its asdu.TypeID.
 //
-// The canonical form is the bare mnemonic (IEC104_GO_BRIDGE.md), e.g.
+// The canonical form is the bare mnemonic e.g.
 // "C_SC_NA_1". Some MSL5 point records append the numeric type identification
 // to the mnemonic - "C_SC_NA_1_45", where 45 is C_SC_NA_1's TypeID - so one
 // trailing "_<digits>" suffix is stripped and the lookup retried. The suffix is
@@ -105,8 +101,7 @@ func isDigits(s string) bool {
 }
 
 // typeNameByID is the reverse of typeIDByName. asdu.TypeID.String() returns
-// "TID<C_IC_NA_1>" (a debug format), not the bare mnemonic the bridge protocol
-// expects, so outgoing events go through this table instead.
+// "TID<C_IC_NA_1>" (a debug format), not the bare mnemonic callers expect, so events go through this table instead.
 var typeNameByID = func() map[asdu.TypeID]string {
 	m := make(map[asdu.TypeID]string, len(typeIDByName))
 	for name, id := range typeIDByName {
@@ -115,49 +110,10 @@ var typeNameByID = func() map[asdu.TypeID]string {
 	return m
 }()
 
-// typeNameFromID resolves an asdu.TypeID to its bridge point.asduTyp string.
+// typeNameFromID resolves an asdu.TypeID to its mnemonic.
 func typeNameFromID(typeId asdu.TypeID) string {
 	if name, ok := typeNameByID[typeId]; ok {
 		return name
 	}
 	return typeId.String()
-}
-
-// commandValueFromPayload decodes the `{"value": ...}` JSON object carried in
-// point.payload into the Go type client.Client.SendCmd expects for
-// typeId, mirroring the type switch in wendy512/iec104's doSend.
-//
-// The MSL5 backend guarantees (IEC104_GO_BRIDGE_SYNC.md) that points[].payload
-// is always `{"value": <scalar>}` with a correctly typed scalar for every
-// command point it dispatches, and that a command point without a valid
-// command value is omitted from the batch entirely. A missing or null value
-// here is therefore a protocol violation: report it instead of silently
-// defaulting to false/0 (cast.ToBoolE(nil) and friends return the zero value
-// with a nil error, which would send a bogus command).
-func commandValueFromPayload(typeId asdu.TypeID, payloadJSON json.RawMessage) (any, error) {
-	var payload struct {
-		Value any `json:"value"`
-	}
-	if len(payloadJSON) > 0 {
-		if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
-			return nil, fmt.Errorf("invalid payload: %w", err)
-		}
-	}
-	if payload.Value == nil {
-		return nil, fmt.Errorf("missing payload.value for command asduTyp %s", typeNameFromID(typeId))
-	}
-	switch typeId {
-	case asdu.C_SC_NA_1, asdu.C_SC_TA_1:
-		return cast.ToBoolE(payload.Value)
-	case asdu.C_DC_NA_1, asdu.C_DC_TA_1, asdu.C_RC_NA_1, asdu.C_RC_TA_1:
-		return cast.ToUint8E(payload.Value)
-	case asdu.C_SE_NA_1, asdu.C_SE_TA_1, asdu.C_SE_NB_1, asdu.C_SE_TB_1:
-		return cast.ToInt16E(payload.Value)
-	case asdu.C_SE_NC_1, asdu.C_SE_TC_1:
-		return cast.ToFloat32E(payload.Value)
-	case asdu.C_BO_NA_1, asdu.C_BO_TA_1:
-		return cast.ToUint32E(payload.Value)
-	default:
-		return nil, fmt.Errorf("asduTyp %v does not take a command value", typeId)
-	}
 }

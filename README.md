@@ -1,4 +1,4 @@
-# IEC 60870-5-104 Go Test System
+﻿# IEC 60870-5-104 Go Test System
 
 A minimal IEC 60870-5-104 (IEC 104) **master + outstation** test system written in Go,
 built on [`wendy512/iec104`](https://github.com/wendy512/iec104) v1.0.4 and
@@ -15,16 +15,16 @@ iec104_server/   outstation ("slave")
   main.go        flags, listener lifecycle
   handler.go     CommandHandler + process image + periodic/spontaneous reporting
   confirm.go     fresh-ASDU confirmation builders (the bug workaround)
-iec104_client/   master ("client")
-  main.go        connection lifecycle, stdio bridge wiring (-demo skips it), -demo command sequence
-  call.go        ASDUCall implementation (all replies & data), forwards every event to the bridge
-  bridge.go      NDJSON stdin/stdout bridge (ready / dispatch -> ack / event), see IEC104_GO_BRIDGE.md
-  bridge_test.go pipe-based round-trip tests of the bridge protocol
-  typemap.go     asduTyp <-> asdu.TypeID conversion for the bridge protocol
+iec104_app/      master application; the IEC 104 client is its hardware layer (no stdin/stdout protocol)
+  main.go        flags, signal handling, wiring
+  demo.go        built-in demo command sequence (-demo)
+  events.go      event sink (logs hardware events)
+  hardware/      layer.go (Run/Send/Events), config.go, types.go (Command/Event), commander.go (command dispatch),
+                 handler.go + replies.go (ASDU callbacks), registry.go (Meta tagging), connect.go, typemap.go, value.go
 build.sh         cross-build static linux/arm64 binaries into dist/ (CGO off)
 pull.sh          token-authenticated fast-forward pull from GitHub (Raspberry Pi)
 deploy/          systemd units + install.sh / uninstall.sh for the Pi
-docs/            architecture.md, iec104_client_architecture.md
+docs/            architecture.md (legacy stdio-bridge design notes in iec104_client_architecture.md)
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) and
@@ -36,25 +36,22 @@ for the bridge design and [`IEC104_GO_BRIDGE.md`](IEC104_GO_BRIDGE.md) for the w
 ```powershell
 # build both - run each module's build from inside that module's folder
 cd iec104_server; go build ./...      # writes .\iec104_server\iec104-server.exe
-cd ..\iec104_client; go build ./...   # writes .\iec104_client\iec104-client.exe
+cd ..\iec104_app; go build ./...      # writes .\iec104_app\iec104-app.exe
 
 # terminal 1 - outstation (runs until Ctrl+C, or pass -duration)
 .\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
 
-# terminal 2 - master: by default it runs as the stdio bridge, reading NDJSON
-# "dispatch" requests on stdin and writing "ready"/"ack"/"event" lines to stdout
-# (normally the MSL5 backend spawns it; stdin EOF shuts it down). With -demo it
-# skips the bridge entirely and instead sends the built-in demo command
-# sequence once the outstation confirms STARTDT
-.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s          # stdio bridge mode
-.\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -demo -duration 40s   # demo only, no bridge
+# terminal 2 - master (hardware-layer app): runs until Ctrl+C or -duration, logging events;
+# with -demo it sends the built-in demo command sequence once the outstation confirms STARTDT
+.\iec104_app\iec104-app.exe -host 127.0.0.1 -port 2404 -duration 40s
+.\iec104_app\iec104-app.exe -host 127.0.0.1 -port 2404 -demo -duration 40s
 ```
 
 The executable names come from the module paths (`github.com/alfas/iec104-server`
-/ `-client`), not from the folder names, which is why `go build ./...` inside each
-folder produces exactly the `iec104-server.exe` / `iec104-client.exe` used above.
-Note that `cd iec104_server; go build ./...` followed by a plain `cd iec104_client`
-fails - the second `cd` is relative to `iec104_server` - so use `cd ..\iec104_client`.
+/ `-app`), not from the folder names, which is why `go build ./...` inside each
+folder produces exactly the `iec104-server.exe` / `iec104-app.exe` used above.
+Note that `cd iec104_server; go build ./...` followed by a plain `cd iec104_app`
+fails - the second `cd` is relative to `iec104_server` - so use `cd ..\iec104_app`.
 
 To capture a run to files, start the outstation with `Start-Process` redirection
 instead of PowerShell's `2>` (in PowerShell 5.1 `2>` wraps the native stderr of the
@@ -65,7 +62,7 @@ client in a `NativeCommandError` record and writes UTF-16). This is exactly how 
 $srv = Start-Process .\iec104_server\iec104-server.exe -ArgumentList '-host','0.0.0.0','-port','2404','-duration','60s' `
        -RedirectStandardOutput logs\srv.out -RedirectStandardError logs\srv.err -PassThru -NoNewWindow
 Start-Sleep -Seconds 2
-cmd /c ".\iec104_client\iec104-client.exe -host 127.0.0.1 -port 2404 -duration 40s 1> logs\client.out 2> logs\client.err"
+cmd /c ".\iec104_app\iec104-app.exe -host 127.0.0.1 -port 2404 -duration 40s 1> logs\client.out 2> logs\client.err"
 $srv.WaitForExit()
 ```
 

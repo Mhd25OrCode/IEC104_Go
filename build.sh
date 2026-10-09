@@ -29,7 +29,7 @@ echo ">> building iec104-server (linux/arm64)"
 ( cd "$ROOT/iec104_server" && go build -trimpath -ldflags "$LDFLAGS" -o "$OUT/iec104-server" . )
 
 echo ">> building iec104-client (linux/arm64)"
-( cd "$ROOT/iec104_client" && go build -trimpath -ldflags "$LDFLAGS" -o "$OUT/iec104-client" . )
+( cd "$ROOT/iec104_app" && go build -trimpath -ldflags "$LDFLAGS" -o "$OUT/iec104-client" . )
 
 echo ">> done - artifacts:"
 ls -l "$OUT"
