@@ -126,6 +126,14 @@ func typeNameFromID(typeId asdu.TypeID) string {
 // commandValueFromPayload decodes the `{"value": ...}` JSON object carried in
 // point.payload into the Go type client.Client.SendCmd expects for
 // typeId, mirroring the type switch in wendy512/iec104's doSend.
+//
+// The MSL5 backend guarantees (IEC104_GO_BRIDGE_SYNC.md) that points[].payload
+// is always `{"value": <scalar>}` with a correctly typed scalar for every
+// command point it dispatches, and that a command point without a valid
+// command value is omitted from the batch entirely. A missing or null value
+// here is therefore a protocol violation: report it instead of silently
+// defaulting to false/0 (cast.ToBoolE(nil) and friends return the zero value
+// with a nil error, which would send a bogus command).
 func commandValueFromPayload(typeId asdu.TypeID, payloadJSON json.RawMessage) (any, error) {
 	var payload struct {
 		Value any `json:"value"`
@@ -134,6 +142,9 @@ func commandValueFromPayload(typeId asdu.TypeID, payloadJSON json.RawMessage) (a
 		if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
 			return nil, fmt.Errorf("invalid payload: %w", err)
 		}
+	}
+	if payload.Value == nil {
+		return nil, fmt.Errorf("missing payload.value for command asduTyp %s", typeNameFromID(typeId))
 	}
 	switch typeId {
 	case asdu.C_SC_NA_1, asdu.C_SC_TA_1:

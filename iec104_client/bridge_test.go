@@ -181,6 +181,26 @@ func TestDispatchRejectedAck(t *testing.T) {
 	}
 }
 
+// TestDispatchMissingCommandValueIsRejected covers the IEC104_GO_BRIDGE_SYNC.md
+// guarantee: the backend always sends payload.value for command points (and
+// omits points that have none). If a command point arrives without one, the
+// bridge must reject it per-point and send nothing - never default the missing
+// value to a false/0 command.
+func TestDispatchMissingCommandValueIsRejected(t *testing.T) {
+	h := newHarness(t)
+	h.next(t) // ready
+
+	h.send(t, `{"op":"dispatch","reqId":"12","type":"OUT","points":[`+
+		`{"id":"m","type":"OUT","asduTyp":"C_SC_NA_1","asduLow":1,"ioaLow":5}]}`)
+	ack := h.next(t)
+	if ack["reqId"] != "12" || ack["accepted"] != false || !strings.Contains(ack["message"].(string), "payload.value") {
+		t.Fatalf("unexpected ack: %v", ack)
+	}
+	if len(h.fake.sent) != 0 {
+		t.Fatalf("command with a missing value must not be sent: %+v", h.fake.sent)
+	}
+}
+
 func TestEventEchoesDispatchedPoint(t *testing.T) {
 	h := newHarness(t)
 	h.next(t)
