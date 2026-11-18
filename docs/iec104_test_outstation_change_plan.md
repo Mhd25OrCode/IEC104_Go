@@ -1,6 +1,13 @@
 # IEC 60870-5-104 – Test Outstation – Required Changes
 
-**Status: planning only – no code was modified.**
+**Status: implemented (2026-11-18).** See §11 "Implementation status" for what was
+changed, where, and how it was verified. The analysis below is kept as the
+original plan; §1 deployment facts still hold except that the repository no
+longer ships a master client (`dist/iec104-client` is gone).
+
+> **Status history:** *planning only – no code was modified* (2026-11-16) →
+> *implemented* (2026-11-18, uncommitted working-copy changes:
+> `iec104_server/main.go`, `handler.go`, `confirm.go`, new `handler_test.go`).
 
 - Target repository: `https://github.com/Mhd25OrCode/IEC104_Go`, folder `iec104_server`
   (the Go outstation, deployed on the device as the systemd unit `iec104-server`).
@@ -23,7 +30,7 @@
 
 | Item | Value |
 |---|---|
-| Binary build | `build.sh` → `CGO_ENABLED=0 GOOS=linux GOARCH=arm64`, output `dist/iec104-server` (and `dist/iec104-client`) |
+| Binary build | `build.sh` → `CGO_ENABLED=0 GOOS=linux GOARCH=arm64`, output `dist/iec104-server` (the `dist/iec104-client` output was removed on 2026-11-18 with the master client) |
 | Install | `deploy/install.sh` (as root): user `iec104`, prefix `/opt/iec104`, unit copied to `/etc/systemd/system/iec104-server.service`, `systemctl enable --now iec104-server.service` |
 | Unit | `ExecStart=/opt/iec104/iec104-server -host 0.0.0.0 -port 2404`, `Restart=always`, `RestartSec=2` |
 | Logs | `journalctl -u iec104-server -f` (stdout of the process; `-verbose` enables `go-iecp5` frame logging) |
@@ -237,7 +244,7 @@ On the CM5 (or cross-build host with Go ≥ 1.27.1 as pinned in `go.mod`):
 
 ```bash
 cd IEC104_Go
-./build.sh                       # -> dist/iec104-server (linux/arm64), dist/iec104-client
+./build.sh                       # -> dist/iec104-server (linux/arm64) only
 # optional smoke test on the host:
 #   ./dist/iec104-server -host 127.0.0.1 -port 2404 -verbose
 sudo ./deploy/install.sh         # user iec104, /opt/iec104, systemd unit, enable+start
@@ -254,8 +261,10 @@ sudo systemctl --no-pager --full status iec104-server
 
 Notes:
 
-- `install.sh` also disables/starts `iec104-client-demo`; the demo unit must stay stopped
-  while MSL5 is the only master (the README states: only one master per outstation).
+- `install.sh` also disables and deletes the legacy master units
+  (`iec104-client.service`, `iec104-client-demo.service`) and `/opt/iec104/iec104-client`;
+  only one master may talk to the outstation at a time (the README states: only one
+  master per outstation).
 - `deploy/iec104-server.service` keeps `ExecStart=/opt/iec104/iec104-server -host 0.0.0.0
   -port 2404`: with the new default (`-spontaneous-toggle=false`, see O1a) the commanded
   values are no longer overwritten every 2 s. To restore the old alternating demo, start
@@ -276,8 +285,10 @@ Notes:
    `value: true`. Repeat with `false`.
 6. Read an unused IOA (e.g. 999) → MSL5 must store a `C_RD_NA_1` payload with
    `cot.cause = 47`.
-7. Regression: GI from `iec104-client-demo` (`sudo systemctl start iec104-client-demo`,
-   MSL5 stopped) must still produce the five `M_*` frames and the two reporting loops.
+7. Regression: general interrogation from any standard master (the removed
+   `iec104-client-demo` unit is no longer available; the live check in §11 used
+   `wendy512/iec104`'s client) must still produce the five `M_*` frames and start
+   the two reporting loops.
 
 ---
 
@@ -337,3 +348,59 @@ the flag remains as an opt-in (O1a).
 | O4 logging + README update | ~1 h |
 | Build, deploy, verification on the device | ~1 h |
 | Total | ~1 day |
+
+---
+
+## 11. Implementation status (2026-11-18)
+
+All required changes **O1, O1a, O2, O3, O4** are implemented in
+`iec104_server/`; the plan above is kept as the rationale.
+
+| Plan item | Implementation |
+| :-- | :-- |
+| **O1** process image / no uncontrolled writes | `handler.go`: `periodicTick`/`spontaneousTick` only advance the image when `toggle` (`-spontaneous-toggle`) is set; commands are the only other writers |
+| **O1a** `-spontaneous-toggle` flag | `main.go` (`flag.Bool`, default `false`), stored in `station.toggle` |
+| **O2** native read answers | `handler.go OnRead`: IOA 100 → `M_SP_NA_1`, 200 → `M_DP_NA_1`, 300 → `M_ME_NA_1`, 301 → `M_ME_NC_1`, 302 → `M_ME_TF_1`, 400 → `M_IT_NA_1` (COT 5); anything else → `C_RD_NA_1` with COT 47 (`confirmReadError`) |
+| **O3** echo the request CA (mandatory) | every handler uses `pack.CommonAddr`; `-ca` is only used by the unsolicited demo loops. GI/CI data and terminations included (`confirmInterrogation(..., ca, …)`, `sendAllData(conn, ca)`, `sendCounters(conn, ca)`) |
+| **O4** logging | `logApplied()` prints the whole process image after each command; every handler logs type, IOA, COT and CA |
+| helpers | `confirm.go`: `sendCounterRequest`, `confirmReadError`, `sendMeasuredFloatTime`, plus tagged support in `confirmSingleCmd`/`confirmDoubleCmd`/`confirmBitsString32Cmd`/`confirmSetpoint*` (the tagged types still cannot be decoded upstream, see §7.1) |
+| tests | new `iec104_server/handler_test.go` (7 tests, see below) |
+
+Decisions taken on the open questions:
+
+* **OQ-O1 (`C_SE_NA_1`) — raw int16, not per-unit.** MSL5 sends engineering
+  values for both int16 set-point forms; dividing by 32768 would make a
+  `C_SE_NA_1` write read back 32768× smaller than what the operator entered.
+  Documented in `README.md` ("Known limitations / deviations").
+* **OQ-O5 (read of IOA 302) — `M_ME_TF_1`**, consistent with `sendAllData`.
+* **OQ-O3 (`C_RP_NA_1`) — not implemented.** The command is acknowledged
+  (`ActivationCon`) but does not reset the image; resetting would silently zero
+  values the operator just wrote.
+* Risk §7.4 (loops restart per connection only after a GI) is unchanged and
+  deliberate: an MSL5 session that only writes and reads must not receive
+  periodic/spontaneous traffic between a command and its read-back.
+
+Verification (Windows, Go 1.27.4):
+
+```text
+go vet ./...     # clean
+go test ./...    # ok  github.com/alfas/iec104-server
+  TestCommandsApplyToProcessImage            (6 command types, type/COT 7/CA/IOA)
+  TestReadAnswersWithNativeTypes             (6 native read answers)
+  TestReadUnknownIOA                         (C_RD_NA_1, COT 47)
+  TestReadBackAfterCommand                   (write → read returns the written value)
+  TestInterrogationSequenceEchoesRequestCA   (7 → 20 → 10 on the request CA)
+  TestCounterInterrogationEchoesRequestCA    (7 → 37 → 10 on the request CA)
+  TestTicksRespectToggleFlag                 (no drift/flip without the flag)
+```
+
+A live session (real listener + `wendy512/iec104` master client, STARTDT
+handshake) confirmed end to end: `C_SC_NA_1` → COT 7, `C_RD_NA_1` IOA 100 →
+`M_SP_NA_1` COT 5 `false`, `C_SE_NC_1` 42.5 → COT 7, read IOA 301 →
+`M_ME_NC_1` COT 5 `42.5`, read IOA 9999 → `C_RD_NA_1` COT 47.
+
+Repository scope change in the same pass: the master application
+(`iec104_app/`), its systemd demo unit, the NDJSON bridge documentation and the
+`dist/iec104-client` artefact were removed — the repository now ships the
+outstation only, and `build.sh` / `deploy/install.sh` install just
+`iec104-server` (the installer also cleans up legacy client units and binary).

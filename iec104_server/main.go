@@ -20,6 +20,9 @@ func main() {
 	ca := flag.Uint("ca", 1, "ASDU common address")
 	period := flag.Duration("period", 3*time.Second, "periodic reporting interval")
 	spont := flag.Duration("spontaneous", 2*time.Second, "spontaneous reporting interval")
+	toggle := flag.Bool("spontaneous-toggle", false,
+		"legacy demo: flip IOA 100 and drift the analog of IOA 301/302 on every reporting tick"+
+			" (off: reported values only change through commands)")
 	duration := flag.Duration("duration", 0, "run for this long, then exit (0 = until Ctrl+C)")
 	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors)")
 	flag.Parse()
@@ -39,6 +42,7 @@ func main() {
 		spVal:  true,
 		dpVal:  asdu.DPIDeterminedOn,
 		ana:    100,
+		toggle: *toggle,
 		period: *period,
 		spont:  *spont,
 	}
@@ -52,7 +56,8 @@ func main() {
 	})
 
 	s.Start()
-	log.Printf("IEC 104 outstation listening on %s:%d (common addr %d)", *host, *port, *ca)
+	log.Printf("IEC 104 outstation listening on %s:%d (demo CA %d; request answers echo the request CA)",
+		*host, *port, *ca)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if *duration > 0 {

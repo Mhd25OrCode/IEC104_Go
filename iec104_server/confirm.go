@@ -220,3 +220,32 @@ func confirmSetpointFloat(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonA
 	}
 	return conn.Send(u)
 }
+
+// sendCounterRequest reports an integrated total as a brand-new M_IT_NA_1.
+//
+// It cannot use asdu.IntegratedTotals: that helper accepts only
+// Spontaneous(3) and RequestByGeneralCounter(37)..RequestByGroup4Counter(41),
+// and returns ErrCmdCause for Request(5) - the cause a C_RD_NA_1 answer must
+// carry.
+func sendCounterRequest(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr, ioa asdu.InfoObjAddr, value asdu.BinaryCounterReading) error {
+	u := newCommandASDU(conn, asdu.M_IT_NA_1, cause, ca)
+	if err := u.AppendInfoObjAddr(ioa); err != nil {
+		return err
+	}
+	u.AppendBinaryCounterReading(value)
+	return conn.Send(u)
+}
+
+// confirmReadError answers a read command for an address that is not part of the
+// process image with a C_RD_NA_1 carrying the given cause (asdu.UnknownIOA = 47).
+//
+// Built fresh because pack.GetReadCmd() has already consumed the request, and
+// because the read dispatch must keep the transmitted IOA (unlike the
+// InfoObjAddrIrrelevant used by the station-level confirmations above).
+func confirmReadError(conn asdu.Connect, ca asdu.CommonAddr, cause asdu.Cause, ioa asdu.InfoObjAddr) error {
+	u := newCommandASDU(conn, asdu.C_RD_NA_1, cause, ca)
+	if err := u.AppendInfoObjAddr(ioa); err != nil {
+		return err
+	}
+	return conn.Send(u)
+}

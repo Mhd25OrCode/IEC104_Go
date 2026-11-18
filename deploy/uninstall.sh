@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# uninstall.sh - stop/disable and remove the IEC 104 services + binaries.
+# uninstall.sh - stop/disable and remove the IEC 104 outstation service + binary.
 # Run as root:
 #
 #   sudo ./deploy/uninstall.sh
@@ -8,8 +8,8 @@ set -euo pipefail
 
 PREFIX="/opt/iec104"
 UNITS_DIR="/etc/systemd/system"
-# iec104-client.service is legacy (the backend spawns the client now); listed so
-# an older deployment is cleaned up too.
+# The master-client units are listed too: older deployments installed them and
+# this repository is server-only now, so uninstall also cleans the legacy units.
 UNITS=("iec104-server.service" "iec104-client.service" "iec104-client-demo.service")
 
 if [[ "$(id -u)" -ne 0 ]]; then

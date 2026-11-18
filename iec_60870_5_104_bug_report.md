@@ -1,5 +1,17 @@
 # IEC 60870-5-104 — Verified Bugs and Working Functions
 
+> **Historical note (2026-11-18).** This report was written while the repository
+> shipped both an outstation (`iec104_server/`) and a master client
+> (`iec104_client/`, later `iec104_app/`, the "hardware layer" with the NDJSON
+> stdio bridge). The master side has since been removed: the repository is now
+> **outstation-only**, and the master is the MSL5 backend's IEC 104 client. Where
+> this report describes a client (`iec104_client/main.go`, `iec104_app/…`,
+> `bridge.go`, `call.go`, `IEC104_GO_BRIDGE.md`, `logs\client*.out`), it refers to
+> that earlier layout and to the *peer* of the outstation — the protocol findings
+> themselves are unchanged and still apply to any master (including the backend's).
+> Current layout and behaviour: [`README.md`](README.md) and
+> [`docs/architecture.md`](docs/architecture.md).
+
 ## 1. Summary
 
 During testing of `wendy512/iec104` / `go-iecp5`, two separate issues were identified:

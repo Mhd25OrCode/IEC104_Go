@@ -1,105 +1,327 @@
-﻿# IEC 60870-5-104 Go Test System
+# IEC 60870-5-104 Outstation (Go)
 
-A minimal IEC 60870-5-104 (IEC 104) **master + outstation** test system written in Go,
-built on [`wendy512/iec104`](https://github.com/wendy512/iec104) v1.0.4 and
-[`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5) v1.2.5.
+A minimal IEC 60870-5-104 ("IEC 104") **outstation** ("slave" / server) written in
+Go, built on [`wendy512/iec104`](https://github.com/wendy512/iec104) v1.0.4
+(IEC 104 transport) and [`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5)
+v1.2.5 (ASDU codec).
 
-It demonstrates the core protocol fundamentals and implements the *correct*
-confirmation sequences that the library's bundled example does **not**
-(see `iec_60870_5_104_bug_report.md` for background).
+This repository contains the **outstation only**. The master that drives it is the
+MSL5 backend's IEC 104 client (the `src/apps/backend/internal/device/iec104/`
+package of the backend repository), which owns the single TCP session and uses a
+small set of object types (see ["What the master sends"](#what-the-master-sends)).
+Everything else in this server — general/counter interrogation, background
+reporting, clock sync, test, reset, delay acquisition — exists so the outstation
+can also be driven by any standard IEC 104 master and regression-tested without
+the backend.
 
 ## Layout
 
 ```
-iec104_server/   outstation ("slave")
-  main.go        flags, listener lifecycle
-  handler.go     CommandHandler + process image + periodic/spontaneous reporting
-  confirm.go     fresh-ASDU confirmation builders (the bug workaround)
-iec104_app/      master application; the IEC 104 client is its hardware layer (no stdin/stdout protocol)
-  main.go        flags, signal handling, wiring
-  demo.go        built-in demo command sequence (-demo)
-  events.go      event sink (logs hardware events)
-  hardware/      layer.go (Run/Send/Events), config.go, types.go (Command/Event), commander.go (command dispatch),
-                 handler.go + replies.go (ASDU callbacks), registry.go (Meta tagging), connect.go, typemap.go, value.go
-build.sh         cross-build static linux/arm64 binaries into dist/ (CGO off)
-pull.sh          token-authenticated fast-forward pull from GitHub (Raspberry Pi)
-deploy/          systemd units + install.sh / uninstall.sh for the Pi
-docs/            architecture.md (legacy stdio-bridge design notes in iec104_client_architecture.md)
+iec104_server/      outstation
+  main.go           flags, listener lifecycle, connect/disconnect logging
+  handler.go        CommandHandler: process image, read dispatch, demo reporting
+  confirm.go        fresh-ASDU confirmation/data builders (library workaround)
+  handler_test.go   unit tests: commands, reads, GI/CI sequences, tick behaviour
+build.sh            cross-build a static linux/arm64 binary into dist/ (CGO off)
+pull.sh             token-authenticated fast-forward pull from GitHub (Raspberry Pi)
+deploy/             systemd unit + install.sh / uninstall.sh for the Pi
+docs/               architecture.md, iec104_test_outstation_change_plan.md
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) and
-[`docs/iec104_client_architecture.md`](docs/iec104_client_architecture.md) §7
-for the bridge design and [`IEC104_GO_BRIDGE.md`](IEC104_GO_BRIDGE.md) for the wire protocol.
+See [`docs/architecture.md`](docs/architecture.md) for the file-by-file design,
+the dispatch/confirmation flow and the testing approach.
 
 ## Build & run
 
 ```powershell
-# build both - run each module's build from inside that module's folder
-cd iec104_server; go build ./...      # writes .\iec104_server\iec104-server.exe
-cd ..\iec104_app; go build ./...      # writes .\iec104_app\iec104-app.exe
+cd iec104_server
+go build ./...        # writes .\iec104-server.exe
+go test ./...         # unit tests (no network, no ports)
 
-# terminal 1 - outstation (runs until Ctrl+C, or pass -duration)
-.\iec104_server\iec104-server.exe -host 0.0.0.0 -port 2404 -duration 60s
+# run until Ctrl+C (or pass -duration 60s)
+.\iec104-server.exe -host 0.0.0.0 -port 2404
 
-# terminal 2 - master (hardware-layer app): runs until Ctrl+C or -duration, logging events;
-# with -demo it sends the built-in demo command sequence once the outstation confirms STARTDT
-.\iec104_app\iec104-app.exe -host 127.0.0.1 -port 2404 -duration 40s
-.\iec104_app\iec104-app.exe -host 127.0.0.1 -port 2404 -demo -duration 40s
+# same, with the library's frame/decode log on stderr
+.\iec104-server.exe -port 2404 -verbose
 ```
 
-The executable names come from the module paths (`github.com/alfas/iec104-server`
-/ `-app`), not from the folder names, which is why `go build ./...` inside each
-folder produces exactly the `iec104-server.exe` / `iec104-app.exe` used above.
-Note that `cd iec104_server; go build ./...` followed by a plain `cd iec104_app`
-fails - the second `cd` is relative to `iec104_server` - so use `cd ..\iec104_app`.
+The executable name comes from the module path
+(`github.com/alfas/iec104-server`), not from the folder name. There is no
+client binary in this repository any more, so a live session needs a master:
+either the MSL5 backend, or any third-party IEC 104 master pointed at
+`<host>:2404` with common address `1`.
 
-To capture a run to files, start the outstation with `Start-Process` redirection
-instead of PowerShell's `2>` (in PowerShell 5.1 `2>` wraps the native stderr of the
-client in a `NativeCommandError` record and writes UTF-16). This is exactly how the
-2026-09-25 run below was captured:
+| Flag | Default | Meaning |
+| :-- | :-- | :-- |
+| `-host` | `0.0.0.0` | listen address |
+| `-port` | `2404` | listen port |
+| `-ca` | `1` | common address of unsolicited demo frames (every request-driven answer echoes the request's CA, see below) |
+| `-period` | `3s` | periodic reporting interval (demo path) |
+| `-spontaneous` | `2s` | spontaneous reporting interval (demo path) |
+| `-spontaneous-toggle` | `false` | legacy demo dynamics: flip IOA 100 and drift the analog on every reporting tick; off means reported values only change through commands |
+| `-duration` | `0` | run this long, then exit (`0` = until Ctrl+C / SIGTERM) |
+| `-verbose` | `false` | enable the go-iecp5 library log (frames + decode errors) |
 
-```powershell
-$srv = Start-Process .\iec104_server\iec104-server.exe -ArgumentList '-host','0.0.0.0','-port','2404','-duration','60s' `
-       -RedirectStandardOutput logs\srv.out -RedirectStandardError logs\srv.err -PassThru -NoNewWindow
-Start-Sleep -Seconds 2
-cmd /c ".\iec104_app\iec104-app.exe -host 127.0.0.1 -port 2404 -duration 40s 1> logs\client.out 2> logs\client.err"
-$srv.WaitForExit()
+`-verbose` is the only way to see ASDU decode failures: the library drops a
+frame it cannot decode silently (`sf.Error()` prints nothing unless
+`LogMode(true)`), which is how the `C_BO_TA_1` limitation below shows up.
+
+## Tests
+
+`go test ./...` runs the handler tests in `iec104_server/handler_test.go` against
+a capture connection: each test builds a real master frame with the library's own
+`asdu.*Cmd` helpers, decodes it again, feeds it to the outstation handler and
+then decodes what the outstation sent back. Covered:
+
+| Test | Checks |
+| :-- | :-- |
+| `TestCommandsApplyToProcessImage` | `C_SC`/`C_DC`/`C_SE_NA`/`C_SE_NB`/`C_SE_NC`/`C_BO` land in the process image and are confirmed with their own type, COT 7, the request CA and the request IOA |
+| `TestReadAnswersWithNativeTypes` | `C_RD_NA_1` on IOA 100/200/300/301/302/400 answers `M_SP_NA_1` / `M_DP_NA_1` / `M_ME_NA_1` / `M_ME_NC_1` / `M_ME_TF_1` / `M_IT_NA_1` with COT 5 |
+| `TestReadUnknownIOA` | an unmapped IOA is rejected with `C_RD_NA_1` and COT 47 |
+| `TestReadBackAfterCommand` | the write-then-read pattern of the master reads back exactly what the command stored (no reporting tick overwrites it) |
+| `TestInterrogationSequenceEchoesRequestCA` | `ActivationCon(7)` → data with COT 20 → `ActivationTerm(10)`, all on the request CA |
+| `TestCounterInterrogationEchoesRequestCA` | `ActivationCon(7)` → `M_IT_NA_1` COT 37 → `ActivationTerm(10)` |
+| `TestTicksRespectToggleFlag` | reporting ticks only re-publish the process image unless `-spontaneous-toggle` is set |
+
+## Process image
+
+One mutex-protected process image (`station` in `handler.go`) backs every
+monitored object. Commands write it, `-spontaneous-toggle` may advance it, and
+reads/interrogations report it.
+
+| IOA | Object | Init | Reported as | Written by |
+| :-- | :-- | :-- | :-- | :-- |
+| 100 | single point `spVal` | `true` | `M_SP_NA_1` (read, GI), `M_SP_TB_1` (spontaneous demo) | `C_SC_NA_1` / `C_SC_TA_1` |
+| 200 | double point `dpVal` | determined on (2) | `M_DP_NA_1` (read, GI) | `C_DC_NA_1` / `C_DC_TA_1` |
+| 300 | normalized measurement | `10000` (= 0.305 per unit) | `M_ME_NA_1` (read, GI) | — (fixed value) |
+| 301 | short float `ana` | `100` | `M_ME_NC_1` (read, GI, periodic demo) | `C_SE_NA_1/TA_1`, `C_SE_NB_1/TB_1`, `C_SE_NC_1/TC_1` |
+| 302 | short float with CP56Time2a | `100` (same `ana`) | `M_ME_TF_1` (read, GI, spontaneous demo) | same as IOA 301 (the analog is shared) |
+| 400 | integrated total `counter` | reading `0`, seq `1` | `M_IT_NA_1` (read, counter interrogation demo) | — (fixed value) |
+
+`C_BO_NA_1` / `C_BO_TA_1` values are stored in a separate `bits` field and are
+not reported as a monitored point (no bitstring type is in the master's model);
+they are confirmed and visible in the log only.
+
+## What the master sends
+
+The MSL5 backend uses exactly these objects: single point IOA 100, double point
+IOA 200, analog IOA 301 (and its time-tagged representation 302), plus
+`C_RD_NA_1` reads. Anything else below is for standard masters and regression
+runs.
+
+| Request | Handler | Effect | Answer |
+| :-- | :-- | :-- | :-- |
+| `C_SC_NA_1`, `C_SC_TA_1` | `OnASDU` | `spVal = value` | same type, COT 7, echo IOA/QOC (SCO) |
+| `C_DC_NA_1`, `C_DC_TA_1` | `OnASDU` | `dpVal = value & 0x03` | same type, COT 7, echo IOA/QOC (DCO) |
+| `C_SE_NA_1`, `C_SE_TA_1` | `OnASDU` | `ana = float32(int16 value)` — raw, **not** divided by 32768 | same type, COT 7 |
+| `C_SE_NB_1`, `C_SE_TB_1` | `OnASDU` | `ana = float32(int16 value)` | same type, COT 7 |
+| `C_SE_NC_1`, `C_SE_TC_1` | `OnASDU` | `ana = float32 value` | same type, COT 7 |
+| `C_BO_NA_1`, `C_BO_TA_1` | `OnASDU` | `bits = value` | same type, COT 7 |
+| `C_IC_NA_1` | `OnInterrogation` | starts the demo reporting loops; `Deactivation` answers COT 9 | `C_IC_NA_1` COT 7 → data COT 20 → `C_IC_NA_1` COT 10 |
+| `C_CI_NA_1` | `OnCounterInterrogation` | — | `C_CI_NA_1` COT 7 → `M_IT_NA_1` COT 37 → `C_CI_NA_1` COT 10 |
+| `C_RD_NA_1` | `OnRead` | reads the image | native type with COT 5, or `C_RD_NA_1` with COT 47 |
+| `C_CS_NA_1` | `OnClockSync` | logs the time | `C_CS_NA_1` COT 7 with the echoed CP56Time2a |
+| `C_TS_NA_1` | `OnTestCommand` | — | `C_TS_NA_1` COT 7 (test word) |
+| `C_TS_TA_1` | `OnASDU` | — | `C_TS_TA_1` COT 7 (CP56Time2a) |
+| `C_RP_NA_1` | `OnResetProcess` | — | `C_RP_NA_1` COT 7 (QRP echoed) |
+| `C_CD_NA_1` | `OnDelayAcquisition` | — | `C_CD_NA_1` COT 7 (delay echoed) |
+| `C_RC_NA_1`, `C_RC_TA_1` | — | logged as unhandled, no answer | — |
+
+Command confirmations are always built **after** the value has been stored, so a
+`C_RD_NA_1` issued right after a command reads back what was written.
+
+### Read answers (`C_RD_NA_1`)
+
+| IOA | Answer |
+| :-- | :-- |
+| 100 | `M_SP_NA_1` (single point, COT 5) |
+| 200 | `M_DP_NA_1` (double point, COT 5) |
+| 300 | `M_ME_NA_1` (normalized measurement, COT 5) |
+| 301 | `M_ME_NC_1` (short float, COT 5) |
+| 302 | `M_ME_TF_1` (short float + CP56Time2a, COT 5) |
+| 400 | `M_IT_NA_1` (integrated total, COT 5) |
+| anything else | `C_RD_NA_1` with COT 47 (unknown information object address) |
+
+### Common address semantics
+
+`-ca` is the common address of the frames the **demo loops** push on their own
+(periodic/spontaneous). Every **request-driven** answer — confirmations, read
+answers, interrogation data and terminations, the COT 47 rejection — carries the
+common address of the **request**. The master stores its per-point answers under
+`(CA, IOA)`, so hard-coding the outstation CA in answers would file them under a
+CA the master never asked for.
+
+### Demo/regression paths
+
+Periodic (`M_ME_NC_1` IOA 301, COT 1) and spontaneous (`M_SP_TB_1` IOA 100 and
+`M_ME_TF_1` IOA 302, COT 3) reporting start **only when a general interrogation
+arrives** (i.e. after the STARTDT handshake of a master that interrogates), once
+per session. A master that only writes and reads never sees that traffic, so it
+cannot overwrite a value between a command and its read-back.
+
+Without `-spontaneous-toggle` the ticks just re-publish the process image. With
+the flag the analog drifts by +12.5 per period and wraps to -30 above 220, and
+IOA 100 alternates — the original demo behaviour, which by design overwrites
+commanded values.
+
+## Protocol exchanges exercised
+
+| Direction | ASDU | Cause out | Cause back |
+| :-- | :-- | :-- | :-- |
+| General interrogation | `C_IC_NA_1` | Activation (6) | ActivationCon (7) → data (20) → ActivationTerm (10) |
+| Counter interrogation | `C_CI_NA_1` | Activation (6) | ActivationCon (7) → totals (37) → ActivationTerm (10) |
+| Read | `C_RD_NA_1` | Request (5) | data with COT=Request (5) |
+| Clock sync | `C_CS_NA_1` | Activation (6) | ActivationCon (7), time echoed |
+| Test | `C_TS_TA_1` | Activation (6) | ActivationCon (7), test word |
+| Reset process | `C_RP_NA_1` | Activation (6) | ActivationCon (7) |
+| Delay acquisition | `C_CD_NA_1` | Activation (6) | ActivationCon (7) |
+| Single / Double / Set-point / Bitstring | `C_SC_*` / `C_DC_*` / `C_SE_*` / `C_BO_*` | Activation (6) | ActivationCon (7) |
+| Periodic data (demo) | `M_ME_NC_1` | Periodic (1) | — |
+| Spontaneous data (demo) | `M_SP_TB_1` + `M_ME_TF_1` | Spontaneous (3) | — |
+
+Interrogation data: `M_SP_NA_1`, `M_DP_NA_1`, `M_ME_NA_1`, `M_ME_NC_1`,
+`M_ME_TF_1` (COT 20); counters `M_IT_NA_1` (COT 37).
+
+## Verified run (2026-11-18)
+
+`go vet ./...`, `go test ./...` and a live TCP session were run on Windows with
+Go 1.27.4. All handler tests pass:
+
+```text
+--- PASS: TestCommandsApplyToProcessImage (0.00s)   # 6 command types
+--- PASS: TestReadAnswersWithNativeTypes (0.00s)    # 6 native read answers
+--- PASS: TestReadUnknownIOA (0.00s)
+--- PASS: TestReadBackAfterCommand (0.00s)
+--- PASS: TestInterrogationSequenceEchoesRequestCA (0.00s)
+--- PASS: TestCounterInterrogationEchoesRequestCA (0.00s)
+--- PASS: TestTicksRespectToggleFlag (0.00s)
+ok  	github.com/alfas/iec104-server
 ```
 
-Flags: `-host`, `-port`, `-ca` (common address, default 1),
-server: `-period`/`-spontaneous` (reporting intervals),
-both: `-duration` (how long to run; **default `0`** = run until Ctrl+C/SIGTERM, or, in bridge mode, until stdin closes),
-both: `-verbose` (enable the go-iecp5 frame/decode log, off by default).
-Client only: `-demo` (skip the stdio bridge entirely and instead send the
-built-in demo command sequence once the outstation is active, off by default).
-Client only: `-version` (print the module path, VCS revision and bridge protocol
-version — e.g. `bridge=ndjson/1` — then exit; use it to confirm which build is
-installed).
-In bridge mode **stdout carries only protocol lines**; every log/diagnostic
-(including the `-verbose` library log) goes to stderr.
+The live check started the real listener on an ephemeral port and drove it with
+the library's own master client (`github.com/wendy512/iec104/client`, STARTDT
+handshake completed). Outstation log and master observations of that session:
+
+```text
+[server] single command: IOA=100 value=false COT=COT<Activation> CA=1
+[server] applied: spVal=false dpVal=2 ana=100 bits=0x00000000
+master: C_SC_NA_1 -> type=C_SC_NA_1 COT=7 CA=1
+[server] read command: IOA=100 CA=1
+master: read IOA 100 -> type=M_SP_NA_1 COT=5 value=[{100 false ...}]
+[server] setpoint float command: IOA=301 value=42.5 COT=COT<Activation> CA=1
+[server] applied: spVal=false dpVal=2 ana=42.5 bits=0x00000000
+[server] read command: IOA=301 CA=1
+master: read IOA 301 -> type=M_ME_NC_1 COT=5 value=[{301 42.5 ...}]
+[server] read command: IOA=9999 is not a monitored object
+master: read IOA 9999 -> type=C_RD_NA_1 COT=47
+```
+
+This is the master's write-then-read verification pattern end to end: the
+command is confirmed with COT 7, the following read answers with the object's
+native type, and an unknown IOA is rejected instead of returning an invented
+value.
+
+## Key implementation points
+
+### 1. Confirmations are fresh ASDUs, never mirrors
+
+`GetSingleCmd()`, `GetInterrogationCmd()`, `GetCounterInterrogationCmd()`,
+`GetReadCmd()`, `GetResetProcessCmd()` and `GetDelayAcquireCommand()` are not
+side-effect-free getters: they **consume** the ASDU's information-object buffer.
+The cs104 server dispatcher calls them *before* the application handler runs, so
+a `SendReplyMirror(...)` issued in a handler is assembled from already-drained
+data and reaches the master empty or truncated (`asdu UnmarshalBinary failed,
+EOF`). cs104 also answers a non-nil handler error with its own
+`SendReplyMirror(UnknownTypeID)`.
+
+Therefore each handler here:
+
+1. parses the request with `pack.Get*Cmd()` only to *read* parameters,
+2. stores the value in the process image,
+3. builds a brand-new ASDU (`asdu.NewASDU` + `AppendInfoObjAddr` + `Append*`)
+   with the right cause and the request's common address, and sends it,
+4. reports send failures through `replyOrLog()` instead of returning them, so
+   the library can never emit a mirrored reply.
+
+`confirm.go` also hand-builds `M_ME_TF_1`, `M_IT_NA_1`, `C_RD_NA_1` rejections and
+`C_TS_TA_1` confirmations, because the library's helpers restrict the cause of
+transmission (e.g. `asdu.MeasuredValueFloatCP56Time2a` rejects COT 20/5 and
+`asdu.BitsString32Cmd` only allows Activation/Deactivation).
+
+### 2. Values are stored before they are confirmed
+
+`applySingle` / `applyDouble` / `applyAnalog` / `applyBits` run before the
+confirmation is sent, and the whole image is logged (`[server] applied: …`), so
+the outstation log can be compared with what the master shows.
+
+### 3. Reads are typed, not generic
+
+The master keeps `IN` values per `(CA, IOA)` and expects the ASDU type that
+represents the object: answering a read of the analog with `M_SP_NA_1` would
+store the answer under a type the UI never displays. `OnRead` therefore switches
+on the IOA and answers with the native type, and rejects unknown IOAs with
+COT 47.
+
+## Library bugs and how they are handled
+
+Three defects in the dependency stack (`wendy512/iec104` v1.0.4 +
+`wendy512/go-iecp5` v1.2.5/v1.2.6) shape the code in `iec104_server/`. The full
+reproduction notes are kept in
+[`iec_60870_5_104_bug_report.md`](iec_60870_5_104_bug_report.md); that document
+was written when this repository also shipped a master client, so its
+client-side observations describe the peer, not code in this repository.
+
+| # | Bug | Fails on | Responsible side | Status here |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | `SendReplyMirror()` after `Get*Cmd()` builds the reply from an already-consumed ASDU | the peer that decodes a command and replies | outstation | ✅ avoided: every answer is a fresh ASDU (`confirm.go`), handler errors are swallowed by `replyOrLog` |
+| 2 | General interrogation never produced `ActivationCon` → data → `ActivationTerm` | the peer that answers the interrogation | outstation | ✅ implemented explicitly in `OnInterrogation` |
+| 3 | `asdu.infoObjSize` has no entry for `C_SC_TA_1` … `C_BO_TA_1` (Type IDs 58–64) | any peer that *receives* one of those types | upstream `go-iecp5` | ⚠ open upstream; untagged `C_BO_NA_1` works, see below |
+
+**Bug 3 in practice.** `ASDU.UnmarshalBinary` → `fixInfoObjSize()` →
+`GetInfoObjSize()` returns `ErrTypeIdentifier` for Type IDs 58–64 and the frame
+is dropped inside cs104's read loop before any handler runs (the sender sees
+`Send` return `nil`; only `-verbose` shows
+`asdu UnmarshalBinary failed,asdu: type identification unknown`). There is no
+application-level fix, because `infoObjSize` is unexported and has no
+registration API. Consequences for this outstation:
+
+* `C_SC_TA_1`, `C_DC_TA_1`, `C_SE_TA_1`, `C_SE_TB_1`, `C_SE_TC_1` never reach
+  the handlers when the master uses the **tagged** command forms — the untagged
+  `C_*_NA_1` / `C_SE_N*_1` forms work and are what the MSL5 backend sends.
+* `C_BO_TA_1` cannot round-trip; use the untagged `C_BO_NA_1` (registered).
+
+The tagged branches are kept in the `OnASDU` switch so a patched/vendored
+`go-iecp5` (adding the seven `infoObjSize` rows, e.g. via a `replace` directive)
+needs no handler changes.
+
+## Known limitations / deviations
+
+| Topic | Behaviour | Why |
+| :-- | :-- | :-- |
+| `C_SE_NA_1` scaling | the int16 value is stored as-is, not divided by 32768 | the master sends engineering values for both int16 set-point forms; rescaling would make the read-back 32768× smaller than what the operator sent |
+| `C_BO_*` bitstring | confirmed and logged, not reported as a monitored point | the master's model has no bitstring point for IOA 400 |
+| `C_RC_NA_1` / `C_RC_TA_1` | logged as unhandled, no confirmation | not implemented |
+| IOA 300 normalized value | constant `10000` (≈0.305 pu) | spare object for standard masters; no command writes it |
+| IOA 400 counter | constant reading `0`, seq `1` | counter interrogation demo only |
+| demo reporting | only starts on a general interrogation, one pair of goroutines per session | keeps a read-after-write session quiet; a monitor master still gets the traffic it asks for |
+| `-spontaneous-toggle` | overwrites commanded values by design | legacy demo dynamics, off by default |
 
 ## Pull / update (`pull.sh`)
 
-`pull.sh` is step 1 of the Raspberry Pi workflow: it pulls the latest changes
-from `github.com/Mhd25OrCode/IEC104_Go` into the working copy. The remote is
-HTTPS, so a GitHub **Personal Access Token (PAT)** is required, and it is read
-from a **local file that never leaves the Pi** (nothing token-related is ever
-pushed to GitHub):
+`pull.sh` pulls the latest changes from `github.com/Mhd25OrCode/IEC104_Go` into
+the working copy on the Pi. The remote is HTTPS, so a GitHub **Personal Access
+Token (PAT)** is required and read from a **local file that never leaves the Pi**
+(nothing token-related is ever pushed to GitHub):
 
 ```bash
 # one-time setup on the Pi (token is not echoed and not written to bash history)
 umask 077
 read -rsp 'GitHub PAT: ' TOK; printf '%s\n' "$TOK" > "$HOME/.iec104-git-token"; unset TOK
 chmod 600 "$HOME/.iec104-git-token"
-
-# optional sanity check: expect 200
-curl -sS -o /dev/null -w '%{http_code}\n' \
-  -H "Authorization: Bearer $(< "$HOME/.iec104-git-token")" \
-  https://api.github.com/repos/Mhd25OrCode/IEC104_Go
 ```
 
-The file holds the token on a single line, with no `Bearer` prefix and no
-quotes (CR/LF and surrounding whitespace are trimmed). A fine-grained token with
+The file holds the token on a single line, with no `Bearer` prefix and no quotes
+(CR/LF and surrounding whitespace are trimmed). A fine-grained token with
 `Contents: Read-only` on this one repository is enough.
 
 ```bash
@@ -112,55 +334,30 @@ quotes (CR/LF and surrounding whitespace are trimmed). A fine-grained token with
 ```
 
 Token resolution order: `--token-file <path>` → `$IEC104_GIT_TOKEN_FILE` →
-`$HOME/.iec104-git-token`. The token is never written to `.git/config` (the
-fetch uses an explicit `https://x-access-token:<PAT>@…` URL and then
-`git merge --ff-only FETCH_HEAD`), it is redacted from all output, and the
-script refuses to touch a dirty tree unless `--stash`/`--force` is given.
-`.iec104-git-token` (and `*-git-token`) are also listed in `.gitignore` and
-`.git/info/exclude` as a second line of defence. Since `dist/` and `logs/` are
-gitignored, pulling never clobbers build artifacts or captured logs.
-
-A non-fast-forward upstream (force-push) stops the script instead of silently
-resetting the tree; `--force` only discards *your own* local edits.
+`$HOME/.iec104-git-token`. The token is never written to `.git/config` (the fetch
+uses an explicit `https://x-access-token:<PAT>@…` URL and then
+`git merge --ff-only FETCH_HEAD`), it is redacted from all output, and the script
+refuses to touch a dirty tree unless `--stash`/`--force` is given.
+`.iec104-git-token` (and `*-git-token`) are listed in `.gitignore`. Since `dist/`
+and `logs/` are gitignored, pulling never clobbers build artifacts or captured
+logs. A non-fast-forward upstream stops the script instead of silently resetting
+the tree; `--force` only discards *your own* local edits.
 
 ## Raspberry Pi CM4 / CM5 (Debian trixie, arm64) build & deploy
 
 The deployment target is a Raspberry Pi Compute Module 4 or 5 running a
 **64-bit arm64 OS** — Debian GNU/Linux 13 (trixie) arm64 for the CM5, and
-**Raspberry Pi OS 64-bit (Bookworm) or Debian arm64** for the CM4 — with
-systemd. The CM4 is Cortex-A72 (ARMv8-A, AArch64), so the `GOARCH=arm64`
-binaries from `build.sh` are natively supported; a 32-bit (armhf) OS is not
-supported and fails with `Exec format error` (verify with `uname -m`, which
-must print `aarch64`).
+Raspberry Pi OS 64-bit (Bookworm) or Debian arm64 for the CM4 — with systemd.
+The CM4 is Cortex-A72 (ARMv8-A, AArch64), so the `GOARCH=arm64` binary from
+`build.sh` is natively supported; a 32-bit (armhf) OS is not supported and fails
+with `Exec format error` (verify with `uname -m`, which must print `aarch64`).
 
-Both programs run on the same board: the outstation on `0.0.0.0:2404` and the
-master connecting to it over loopback. The master is not a systemd service: the
-MSL5 backend spawns `/opt/iec104/iec104-client` as a child process
-(`IEC104_BRIDGE_BIN`) and talks to it over stdin/stdout (NDJSON).
-
-### End-to-end workflow (pull → build → install)
-
-```bash
-cd ~/IEC104_Go
-./pull.sh                  # 1) pull   - see "Pull / update" above
-./build.sh                 # 2) build  - dist/iec104-{server,client} (static arm64)
-sudo ./deploy/install.sh   # 3) run    - /opt/iec104 + systemd enable --now
-```
-
-> **Run all three after every `pull.sh`.** `build.sh` only refreshes `dist/`; it
-> never touches `/opt/iec104/`, which is the path the MSL5 backend spawns
-> (`IEC104_BRIDGE_BIN`). Skipping `install.sh` therefore leaves the backend on a
-> stale binary — e.g. a pre-bridge (gRPC) client that never prints
-> `{"op":"ready","version":1}`, which the backend reports as
-> `IEC 104 bridge is not running` on every dispatch. `install.sh` prints the
-> `sha256sum` of what it installed (compare it with
-> `sha256sum dist/iec104-client`) and warns if the client carries no NDJSON
-> bridge code; `/opt/iec104/iec104-client -version` must show the current
-> revision and `bridge=ndjson/1`.
+The outstation runs on the same board as the backend and listens on
+`0.0.0.0:2404`; the backend's master client connects to `127.0.0.1:2404`.
 
 ### Prerequisites
 
-Go **1.27.1** (the version pinned in both `go.mod` files) must be available.
+Go **1.27.1** (the version pinned in `iec104_server/go.mod`) must be available.
 Debian 13 ships Go 1.24, which is too old, so either:
 
 ```bash
@@ -181,11 +378,10 @@ go version    # go1.27.1 linux/arm64
 ./build.sh
 ```
 
-Builds static arm64 ELF binaries (CGO disabled, no runtime deps) into `dist/`:
+Builds a static arm64 ELF binary (CGO disabled, no runtime deps):
 
 ```text
 dist/iec104-server
-dist/iec104-client
 ```
 
 `file dist/iec104-server` should report `ELF 64-bit LSB executable, ARM aarch64`.
@@ -195,58 +391,32 @@ toolchain is present.
 > If the scripts lost their executable bit (e.g. copied from Windows or a ZIP),
 > run `chmod +x build.sh deploy/*.sh` first.
 
-### Install as systemd services
+### Install as a systemd service
 
 ```bash
 sudo ./deploy/install.sh
 ```
 
-The installer creates an `iec104` system user, copies the binaries to
-`/opt/iec104/`, and installs two units into `/etc/systemd/system/`:
-`deploy/iec104-server.service` and `deploy/iec104-client-demo.service` (the
-`-demo` master). It then runs `daemon-reload` and `enable --now` on the server
-unit only - the demo unit is installed for manual use and is never enabled (see
-below). There is deliberately **no** unit for the bridge client: the backend
-spawns it. A leftover `iec104-client.service` from an older (gRPC) deployment is
-removed by the installer.
+The installer creates an `iec104` system user, copies the binary to
+`/opt/iec104/`, installs `deploy/iec104-server.service` into
+`/etc/systemd/system/`, then runs `daemon-reload` and `enable --now`. It also
+removes the legacy master units and binary (`iec104-client.service`,
+`iec104-client-demo.service`, `/opt/iec104/iec104-client`) left behind by older
+deployments of this repository, so nothing competes for the outstation link.
 
 ```bash
 systemctl status iec104-server
 journalctl -u iec104-server -f
 ```
 
-### Bridge mode vs. demo mode
+The unit runs with `Restart=always`, as the non-root `iec104` user (port 2404 is
+unprivileged).
 
-The bridge client (`iec104-client` without flags other than host/port) is
-launched by the MSL5 backend, never by systemd. Set `IEC104_BRIDGE_BIN=/opt/iec104/iec104-client`
-and, if needed, `IEC104_BRIDGE_ARGS` (e.g. `["-host","127.0.0.1","-port","2404"]`);
-the backend restarts it with backoff if it exits, and its stderr appears in the
-backend log prefixed with `[bridge]`.
-
-`iec104-client-demo.service` (built-in `-demo` command sequence, no bridge) is
-the only client unit. Only one master may own the outstation link, so **stop the
-backend (or disable its bridge) before starting it**:
+### Smoke test (binary directly, no systemd)
 
 ```bash
-sudo systemctl start iec104-client-demo
-sudo systemctl stop  iec104-client-demo
-journalctl -u iec104-client-demo -f
-```
-
-The demo unit deliberately has **no `[Install]` section**: it is manual-only,
-so `systemctl enable` refuses it and `systemctl preset-all` can never start it
-at boot. It runs with an explicit `-duration 0` — `0` is now the flag default
-(run until stopped), but the unit states it so the intent survives any future
-default change — so it stays up until you stop it, and uses
-`Restart=on-failure` instead of `Restart=always` so neither a clean exit nor a
-crash loop can replay the demo. Port 2404 is unprivileged, so the services run as
-the non-root `iec104` user.
-
-### Smoke test (binaries directly, no systemd)
-
-```bash
-./dist/iec104-server -host 0.0.0.0 -port 2404 -duration 20s &
-./dist/iec104-client -host 127.0.0.1 -port 2404 -demo -duration 15s
+./dist/iec104-server -port 2404 -duration 20s &
+# then let a master connect (backend, or any IEC 104 master), or run the unit
 ```
 
 ### Uninstall
@@ -255,227 +425,31 @@ the non-root `iec104` user.
 sudo ./deploy/uninstall.sh
 ```
 
-Stops and disables the units (including a legacy `iec104-client.service`),
-removes the unit files, and deletes `/opt/iec104/`.
+Stops and disables the unit (plus the legacy client units), removes the unit
+files and deletes `/opt/iec104/`.
 
-## Protocol exchanges exercised
+## Troubleshooting
 
-| Direction | ASDU | Cause out | Cause back |
-| :-- | :-- | :-- | :-- |
-| General interrogation | `C_IC_NA_1` | Activation (6) | ActivationCon (7) → data (20) → ActivationTerm (10) |
-| Counter interrogation | `C_CI_NA_1` | Activation (6) | ActivationCon (7) → totals (37) → ActivationTerm (10) |
-| Read | `C_RD_NA_1` | Request (5) | data with COT=Request (5) |
-| Clock sync | `C_CS_NA_1` | Activation (6) | ActivationCon (7), time echoed |
-| Test | `C_TS_TA_1` | Activation (6) | ActivationCon (7), test word |
-| Reset process | `C_RP_NA_1` | Activation (6) | ActivationCon (7) |
-| Delay acquisition | `C_CD_NA_1` | Activation (6) | ActivationCon (7) |
-| Single / Double / Set-point | `C_SC_NA_1` / `C_DC_NA_1` / `C_SE_*_1` | Activation (6) | ActivationCon (7) |
-| Bitstring-32 (untagged) | `C_BO_NA_1` | Activation (6) | ActivationCon (7) |
-| Bitstring-32 + CP56Time2a | `C_BO_TA_1` | Activation (6) | ActivationCon (7) — frame dropped by the unpatched library, see §14 of the bug report |
-| Periodic data | `M_ME_NC_1` | Periodic (1) | — |
-| Spontaneous data | `M_SP_TB_1` + `M_ME_TF_1` (CP56-tagged) | Spontaneous (3) | — |
+**`missing go.sum entry for module providing package github.com/spf13/cast
+(imported by github.com/wendy512/iec104/client)` next to `iec104_server/go.mod`
+(gopls / VS Code Go).** No file in this repository imports `…/iec104/client`
+any more, and `go.mod`/`go.sum` list only `go-iecp5` and `iec104`; `go build
+./...`, `go vet ./...` and `go test ./...` are green. The diagnostic comes from a
+stale language-server snapshot of a temporary smoke test
+(`iec104_server/zz_smoke_test.go`) that imported the client and was deleted →
+fix by running **Go: Restart Language Server** from the command palette (or
+close VS Code and delete `%LOCALAPPDATA%\gopls\<workspace-hash>`). Do **not** run
+the suggested `go get github.com/wendy512/iec104/client@v1.0.4`: it would add
+`spf13/cast` and reinstate the master-client dependency this repository
+deliberately dropped.
 
-Monitoring data sent in the interrogation response: `M_SP_NA_1`, `M_DP_NA_1`,
-`M_ME_NA_1`, `M_ME_NC_1`, `M_ME_TF_1` (COT 20); counters `M_IT_NA_1` (COT 37).
-Background reporting: `M_ME_NC_1` IOA 301 (COT 1) every `-period`, plus
-`M_SP_TB_1` IOA 100 and `M_ME_TF_1` IOA 302 (COT 3) every `-spontaneous`.
-IOA 302 carries the *same* analog value as IOA 301 (the spontaneous loop reads the
-process image that the periodic loop advances), and that analog drifts by +12.5 per
-period and wraps to -30 once it would exceed 220 — so a long run eventually reports
-negative values on both IOAs.
+## Documentation
 
-## Verified run (2026-09-25)
-
-The two commands above were re-run unchanged (outstation `-duration 60s`, master
-`-duration 40s`, logs kept in `logs/`), and every claim in this README and in
-`iec_60870_5_104_bug_report.md` was re-checked against the result.
-
-| Observation | Result |
-| :-- | :-- |
-| Demo command sequence | 11/11 sent after STARTDT; every expected confirmation arrived with `COT=ActivationCon(7)` |
-| General interrogation | `ActivationCon(7)` → `M_SP_NA_1`/`M_DP_NA_1`/`M_ME_NA_1`/`M_ME_NC_1`/`M_ME_TF_1` (COT 20) → `ActivationTerm(10)` |
-| Counter interrogation | `ActivationCon(7)` → `M_IT_NA_1` IOA 400 (COT 37) → `ActivationTerm(10)` |
-| Read | `M_SP_NA_1` IOA 100 with `COT=Request(5)` |
-| `C_BO_NA_1` (51) | decoded by the peer, `ActivationCon` received, IOA 4001 = `0x0F0F0F0F` |
-| `C_BO_TA_1` (64) | dropped by the peer's decoder — no handler call, no confirmation (§14) |
-| Background reporting over 40 s | 13 × `M_ME_NC_1` IOA 301 (COT 1) + 19 × `M_SP_TB_1` IOA 100 and 19 × `M_ME_TF_1` IOA 302 (COT 3) |
-| Analog drift / wrap | IOA 301 and 302 walked 100.000 → 212.500 → **-30.000** → -17.5 → -5.0 → 7.5 |
-| Shutdown | client `StopDt` at 40 s; outstation exits at 60 s (`server stopped`) |
-| Client TCP connections per session | 2 (the first is closed immediately by the library's auto-connect) — normal, also visible in earlier runs |
-
-Master side of that run:
-
-```text
-[client] general interrogation sent
-[client] interrogation reply: IOA=0 QOI=20 COT=COT<ActivationCon>
-[client] single point:    IOA=100 value=true     QDS=0 COT=COT<InterrogatedByStation>
-[client] double point:    IOA=200 value=2        QDS=0 COT=COT<InterrogatedByStation>
-[client] measured normal: IOA=300 value=0.305176 QDS=0 COT=COT<InterrogatedByStation>
-[client] measured float:  IOA=301 value=100.000  QDS=0 COT=COT<InterrogatedByStation> type=TID<M_ME_NC_1>
-[client] measured float:  IOA=302 value=100.000  QDS=0 COT=COT<InterrogatedByStation> type=TID<M_ME_TF_1>
-[client] interrogation reply: IOA=0 QOI=20 COT=COT<ActivationTerm>
-[client] counter interrogation reply: IOA=0 QCC=0x05 COT=COT<ActivationCon>
-[client] integrated totals: IOA=400 count=0 SQ=1 CY=false CA=false IV=false COT=COT<RequestByGeneralCounter>
-[client] counter interrogation reply: IOA=0 QCC=0x05 COT=COT<ActivationTerm>
-[client] single point: IOA=100 value=true QDS=0 COT=COT<Request>
-[client] clock sync reply: IOA=0 time=2026-09-25T13:38:58Z COT=COT<ActivationCon>
-[client] test command reply (CP56): IOA=0 valid-test-word=true COT=COT<ActivationCon>
-[client] reset process reply: IOA=0 QRP=0x01 COT=COT<ActivationCon>
-[client] single command confirmation: IOA=1000 value=true QOC=0 COT=COT<ActivationCon>
-[client] double command confirmation: IOA=2000 value=2 QOC=0 COT=COT<ActivationCon>
-[client] setpoint float confirmation: IOA=3000 value=125.500 COT=COT<ActivationCon>
-[client] bitstring32 command confirmation: IOA=4001 value=0x0F0F0F0F COT=COT<ActivationCon>
-[client] measured float: IOA=301 value=212.500 QDS=0 COT=COT<Periodic>    type=TID<M_ME_NC_1>
-[client] measured float: IOA=301 value=-30.000 QDS=0 COT=COT<Periodic>    type=TID<M_ME_NC_1>
-[client] measured float: IOA=302 value=-30.000 QDS=0 COT=COT<Spontaneous> type=TID<M_ME_TF_1>
-```
-
-With `-verbose` the same session shows the silent type-64 drop next to the working
-type-51 twin:
-
-```text
-cs104 server => [D]: RX Raw[68 18 12 00 00 00 40 01 06 00 01 00 a0 0f 00 ff 00 ff 00 ...]  <- C_BO_TA_1 (64)
-cs104 server => [E]: asdu UnmarshalBinary failed,asdu: type identification unknown
-cs104 server => [D]: RX Raw[68 11 14 00 00 00 33 01 06 00 01 00 a1 0f 00 0f 0f 0f 0f]     <- C_BO_NA_1 (51)
-cs104 server => [D]: ASDU TID<C_BO_NA_1> COT<Activation> @1
-[server] bitstring32 command: IOA=4001 value=0x0F0F0F0F COT=COT<Activation>
-```
-
-Without `-verbose` the outstation log holds only the `[server]` application lines
-(716 bytes for the whole 60 s run) — the dropped frame leaves no trace at all,
-which is why the flag exists.
-
-## Key implementation point (the workaround)
-
-`go-iecp5`'s `ASDU.Get*Cmd()` decoders *consume* the internal info-object
-buffer, and the cs104 server dispatcher calls them **before** the application
-handler runs. Therefore a handler must **never** respond with
-`pack.SendReplyMirror(...)` after parsing — the mirrored ASDU would be empty /
-truncated. Instead:
-
-1. parse the request with `pack.Get*Cmd()` to extract the parameters, then
-2. build a brand-new ASDU (`asdu.NewASDU` + `AppendInfoObjAddr` +
-   `AppendBytes/AppendFloat32/...`) with `Cause = ActivationCon`, and send it.
-
-This is implemented in `iec104_server/confirm.go`. It also sidesteps the fact
-that the library's command constructors (`InterrogationCmd`,
-`ClockSynchronizationCmd`, ...) *force* `Activation` and therefore cannot
-produce `ActivationCon` confirmations.
-
-The same rule drives `sendMeasuredFloatTime` (hand-built `M_ME_TF_1`):
-`asdu.MeasuredValueFloatCP56Time2a` accepts only COT Spontaneous/Request, and
-`asdu.BitsString32Cmd` only `Activation`/`Deactivation`, so both confirmations
-and the GI-time-tagged measurement are assembled by hand.
-
-## Library bugs and how they are handled
-
-Three defects were found in the dependency stack while building this system
-(`wendy512/iec104` v1.0.4 + `wendy512/go-iecp5` v1.2.5/v1.2.6). The full
-verification — reproduction steps, A/B evidence and upstream commit hashes — is in
-`iec_60870_5_104_bug_report.md`; the summary is repeated here because these bugs
-directly shape the code in `iec104_server/`.
-
-| # | Bug | Fails on | Responsible side | Status in this repo |
-| :-- | :-- | :-- | :-- | :-- |
-| 1 | `SendReplyMirror()` after `Get*Cmd()` builds the reply from an already-consumed ASDU | the peer that *decodes the command and replies* | **server / outstation** | ✅ Resolved (workaround in `confirm.go`) |
-| 2 | General interrogation never produced `ActivationCon` → data → `ActivationTerm` | the peer that *answers the interrogation* | **server / outstation** | ✅ Resolved (`station.OnInterrogation`) |
-| 3 | `asdu.infoObjSize` has no entry for `C_SC_TA_1` … `C_BO_TA_1` (Type IDs 58–64) | any peer that *receives* one of those types | **upstream `go-iecp5`** (neither app side) | ⚠ Open — untagged `C_BO_NA_1` used instead |
-
-### Bug 1 — `Get*Cmd()` + `SendReplyMirror()`
-
-`GetSingleCmd()`, `GetInterrogationCmd()`, `GetCounterInterrogationCmd()`,
-`GetReadCmd()`, `GetResetProcessCmd()` and `GetDelayAcquireCommand()` are not
-side-effect-free getters: they **consume / advance the ASDU's internal
-information-object buffer**. cs104's server dispatcher calls them *before* the
-application handler runs, so a `pack.SendReplyMirror(...)` issued in the handler is
-assembled from already-drained data and arrives empty or truncated. The peer then
-reports:
-
-```text
-asdu UnmarshalBinary failed, EOF
-```
-
-It is not enough to avoid calling the getter yourself: the dispatcher may already
-have called it, and cs104 *also* answers a non-nil handler error with
-`SendReplyMirror(UnknownTypeID)` on its own. **The defect therefore belongs to the
-replying (server / outstation) side; the client is only the victim that prints the
-error.**
-
-Fix used here (`iec104_server/confirm.go`): treat every ASDU as consumed after a
-`Get*Cmd()`, use it only to *read* parameters, and build a **brand-new ASDU**
-(`asdu.NewASDU` + `AppendInfoObjAddr` + `Append*`) with `Cause = ActivationCon`.
-`handler.go` additionally routes handler errors through `replyOrLog()` so the
-library cannot emit its own mirrored reply. See "Key implementation point" above
-and bug report §2–§4 / §13.
-
-### Bug 2 — General interrogation sequence
-
-With the library's bundled example the client sent `C_IC_NA_1` and the server
-received it, but the standard three-step sequence
-
-```text
-client: C_IC_NA_1  COT=Activation(6)     QOI=20
-server: C_IC_NA_1  COT=ActivationCon(7)  QOI=20
-server: M_*        COT=InterrogatedByStation(20)
-server: C_IC_NA_1  COT=ActivationTerm(10) QOI=20
-```
-
-was never observed. The interrogating **master is not at fault** — it only sends the
-activation; the answering **outstation** owns the confirmation and the termination,
-so this is a server-side defect (an application/example defect, distinct from
-Bug 1 and not fixed by Bug 1's workaround alone).
-
-Fix used here: `station.OnInterrogation` hand-builds the whole sequence —
-`confirmInterrogation(..., ActivationCon, ...)` → `sendAllData(...)` with
-`COT=InterrogatedByStation(20)` → `confirmInterrogation(..., ActivationTerm, ...)`.
-A `Deactivation(8)` request is answered with `DeactivationCon(9)`. Verified
-end-to-end on 2026-09-25 (see the run section above). Bug report §6 / §7 / §13.
-
-### Bug 3 — `infoObjSize` has no entry for Type IDs 58–64
-
-`go-iecp5`'s `asdu/identifier.go` defines the time-tagged command group
-`C_SC_TA_1`, `C_DC_TA_1`, `C_RC_TA_1`, `C_SE_TA_1`, `C_SE_TB_1`, `C_SE_TC_1`,
-`C_BO_TA_1` (Type IDs 58–64) but registers **none** of them in the unexported
-`infoObjSize` map. `ASDU.UnmarshalBinary` → `fixInfoObjSize()` → `GetInfoObjSize()`
-therefore returns `ErrTypeIdentifier`, and the frame is **dropped inside cs104's
-read loop before any handler runs**, with no error at the sender (`Send` returns
-`nil`). The drop is also silent by default — only `-verbose` (`LogMode(true)`)
-surfaces it:
-
-```text
-cs104 server => [E]: asdu UnmarshalBinary failed,asdu: type identification unknown
-```
-
-**Responsibility: the upstream library (`wendy512/go-iecp5`), not either
-application side.** The defect is present in both v1.2.5 and v1.2.6 (identical
-commit `2269ee7`) and is direction-agnostic: it hits whichever peer *receives*
-those types. In this demo that is the **server**, which drops the client's
-`C_BO_TA_1` while the registered untagged twin `C_BO_NA_1` (51) completes its
-round-trip in the same session.
-
-Because `infoObjSize` is unexported and there is no registration API, **there is no
-application-level fix**: only a patched/vendored library (adding the seven rows) or
-the untagged `C_BO_NA_1` works. This repository keeps the complete `C_BO_TA_1`
-code path in place and sends the working `C_BO_NA_1` alongside it — see the next
-section and bug report §14.
-
-## Known limitation — `C_BO_TA_1` (bug report §14)
-
-Bug 3 above means `C_BO_TA_1` cannot complete a `MarshalBinary → UnmarshalBinary`
-round-trip against an unmodified published `go-iecp5`. The application code here is
-complete; only the codec table is missing. Options:
-
-1. **Patch / vendor the library** — add the seven `infoObjSize` rows (58–64) and
-   build against a patched copy, e.g. `replace github.com/wendy512/go-iecp5 =>
-   ./third_party/go-iecp5` in both modules, or `go mod vendor` + edit. This is the
-   only way to make `C_BO_TA_1` round-trip.
-2. **Use the untagged twin `C_BO_NA_1` (51)** — registered and verified working
-   end-to-end; the demo sends it alongside `C_BO_TA_1` (IOA 4001 vs. IOA 4000).
-3. **A custom type ID is not an option** — the type byte on the wire must be 64 for
-   a `C_BO_TA_1`, and the receiver validates it by that byte.
-
-Re-verified on 2026-09-25 (see the run section above): the type-64 frame is still
-dropped while the type-51 twin completes its round-trip. The complete `C_BO_TA_1`
-code path stays in place (`confirmBitsString32Cmd`, the `OnASDU` case, the demo
-command), so patching the size table is the only change needed once upstream fixes
-its decoder.
+* [`docs/architecture.md`](docs/architecture.md) — file responsibilities,
+  dispatch and confirmation flow, concurrency, testing approach.
+* [`docs/iec104_test_outstation_change_plan.md`](docs/iec104_test_outstation_change_plan.md)
+  — the change plan this outstation implements (CA echo, command/read model,
+  reporting behaviour, verification steps).
+* [`iec_60870_5_104_bug_report.md`](iec_60870_5_104_bug_report.md) — library
+  bug analysis. Historical: it was written against an earlier layout that still
+  contained a master client, which has since been removed from this repository.
