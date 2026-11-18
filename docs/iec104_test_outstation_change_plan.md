@@ -404,3 +404,29 @@ Repository scope change in the same pass: the master application
 `dist/iec104-client` artefact were removed — the repository now ships the
 outstation only, and `build.sh` / `deploy/install.sh` install just
 `iec104-server` (the installer also cleans up legacy client units and binary).
+
+---
+
+## Addendum 2026-11-18 — demo reporting removed
+
+The demo/regression reporting described above (O1a `-spontaneous-toggle`,
+`periodicLoop`, `spontaneousLoop`, the `-period` / `-spontaneous` / `-ca` flags)
+has been **removed from the code**, not just disabled. This document is kept as
+history; the current behaviour is:
+
+- `handler.go`: `station` holds only the process image (`mu`, `spVal`, `dpVal`,
+  `ana`, `counter`, `bits`). `startReporting`, `periodicLoop`, `spontaneousLoop`,
+  `periodicTick` and `spontaneousTick` are gone. Commands are the only writer.
+- `OnInterrogation` / `OnCounterInterrogation` stay (the library interface
+  requires them) but answer with a single process-image snapshot —
+  `ActivationCon(7)` → data (COT 20) → `ActivationTerm(10)` / `ActivationCon(7)`
+  → `M_IT_NA_1` (COT 37) → `ActivationTerm(10)`. No general interrogation is
+  needed for commands or `C_RD_NA_1` reads; MSL5 never sends one.
+- `main.go`: only `-host`, `-port`, `-duration`, `-verbose` remain. There is no
+  CA flag: answers echo the request's common address (O3).
+- Tests: `TestTicksRespectToggleFlag` was replaced by
+  `TestCommandsAndReadsWorkWithoutInterrogation`, which asserts exact frame counts
+  (one answer per command/read) on a connection that never sent a GI.
+- README and `docs/architecture.md` were updated accordingly; this file is left
+  in its original form plus this note.
+

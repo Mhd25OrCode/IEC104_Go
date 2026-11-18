@@ -3,7 +3,6 @@ package main
 import (
 	"net"
 	"testing"
-	"time"
 
 	"github.com/wendy512/go-iecp5/asdu"
 )
@@ -71,16 +70,13 @@ func request(t *testing.T, build func(c asdu.Connect) error) *asdu.ASDU {
 	return master.frame(t, 0)
 }
 
-// newTestStation returns a station in its power-on state with reporting
-// intervals long enough that the demo loops never fire during a test.
+// newTestStation returns a station in its power-on state. The outstation has no
+// timers or background reporting, so a test station is always quiet.
 func newTestStation() *station {
 	return &station{
-		ca:     1,
-		spVal:  true,
-		dpVal:  asdu.DPIDeterminedOn,
-		ana:    100,
-		period: time.Hour,
-		spont:  time.Hour,
+		spVal: true,
+		dpVal: asdu.DPIDeterminedOn,
+		ana:   100,
 	}
 }
 
@@ -105,7 +101,7 @@ func commandIOA(sf *asdu.ASDU) asdu.InfoObjAddr {
 
 // TestCommandsApplyToProcessImage checks that each command type used by the MSL5
 // master is stored in the process image and confirmed with its own type, COT 7
-// and the CA of the request (never st.ca).
+// and the CA of the request (never a configured outstation CA).
 func TestCommandsApplyToProcessImage(t *testing.T) {
 	const ca asdu.CommonAddr = 7
 
@@ -367,7 +363,8 @@ func TestReadUnknownIOA(t *testing.T) {
 
 // TestReadBackAfterCommand follows the write-then-read verification pattern of
 // docs/iec104_test_outstation_change_plan.md: the value stored by the command is
-// what the following read reports (no tick may overwrite it).
+// what the following read reports (the process image is the only source of
+// truth and nothing overwrites it).
 func TestReadBackAfterCommand(t *testing.T) {
 	const ca asdu.CommonAddr = 3
 	st := newTestStation()
@@ -414,9 +411,10 @@ func TestReadBackAfterCommand(t *testing.T) {
 	}
 }
 
-// TestInterrogationSequenceEchoesRequestCA checks the demo general
-// interrogation: ActivationCon -> data (COT 20) -> ActivationTerm, all on the
-// CA of the request instead of st.ca.
+// TestInterrogationSequenceEchoesRequestCA checks the standard general
+// interrogation snapshot: ActivationCon -> data (COT 20) -> ActivationTerm, all
+// on the CA of the request instead of a configured CA. The MSL5 master does not
+// send a GI; this path exists for standard masters only.
 func TestInterrogationSequenceEchoesRequestCA(t *testing.T) {
 	const ca asdu.CommonAddr = 5
 	st := newTestStation()
@@ -462,9 +460,9 @@ func TestInterrogationSequenceEchoesRequestCA(t *testing.T) {
 	}
 }
 
-// TestCounterInterrogationEchoesRequestCA checks the counter-interrogation demo
-// path: C_CI ActivationCon, M_IT_NA_1 with COT 37, C_CI ActivationTerm, all on
-// the CA of the request.
+// TestCounterInterrogationEchoesRequestCA checks the counter-interrogation
+// standard-master path: C_CI ActivationCon, M_IT_NA_1 with COT 37, C_CI
+// ActivationTerm, all on the CA of the request.
 func TestCounterInterrogationEchoesRequestCA(t *testing.T) {
 	const ca asdu.CommonAddr = 5
 	st := newTestStation()
@@ -496,24 +494,71 @@ func TestCounterInterrogationEchoesRequestCA(t *testing.T) {
 	}
 }
 
-// TestTicksRespectToggleFlag pins the -spontaneous-toggle behaviour: by default
-// the reporting ticks only re-publish the process image, and the legacy demo
-// dynamics require the flag.
-func TestTicksRespectToggleFlag(t *testing.T) {
+// TestCommandsAndReadsWorkWithoutInterrogation pins the no-GI requirement: on a
+// fresh connection that never sent a general interrogation, commands are applied
+// and reads answer immediately. The exact frame counts prove that no periodic,
+// spontaneous or other unsolicited frame is produced.
+func TestCommandsAndReadsWorkWithoutInterrogation(t *testing.T) {
+	const ca asdu.CommonAddr = 4
 	st := newTestStation()
-	if got := st.periodicTick(); got != 100 {
-		t.Fatalf("periodicTick = %v without -spontaneous-toggle, want 100", got)
-	}
-	if sp, ana := st.spontaneousTick(); !sp || ana != 100 {
-		t.Fatalf("spontaneousTick = (%v, %v) without -spontaneous-toggle, want (true, 100)", sp, ana)
+	conn := newCaptureConn(t)
+
+	read := func(ioa asdu.InfoObjAddr) {
+		t.Helper()
+		if err := st.OnRead(conn, request(t, func(c asdu.Connect) error {
+			return asdu.ReadCmd(c, coa(asdu.Request), ca, ioa)
+		}), ioa); err != nil {
+			t.Fatalf("read IOA %d: %v", ioa, err)
+		}
 	}
 
-	demo := newTestStation()
-	demo.toggle = true
-	if got := demo.periodicTick(); got != 112.5 {
-		t.Fatalf("periodicTick = %v with -spontaneous-toggle, want 112.5", got)
+	// The process image is readable before any command and without a GI.
+	read(100)
+	conn.wantFrames(t, 1)
+	if got := conn.frame(t, 0).GetSinglePoint(); len(got) != 1 || !got[0].Value {
+		t.Fatalf("initial read of IOA 100 = %+v, want value true", got)
 	}
-	if sp, _ := demo.spontaneousTick(); sp {
-		t.Fatal("spontaneousTick did not flip spVal with -spontaneous-toggle")
+
+	// A single command works immediately and is confirmed with COT 7 on the
+	// request CA.
+	if err := st.OnASDU(conn, request(t, func(c asdu.Connect) error {
+		return asdu.SingleCmd(c, asdu.C_SC_NA_1, coa(asdu.Activation), ca,
+			asdu.SingleCommandInfo{Ioa: 100, Value: false})
+	})); err != nil {
+		t.Fatalf("single command: %v", err)
+	}
+	conn.wantFrames(t, 2)
+	confirm := conn.frame(t, 1)
+	if confirm.Type != asdu.C_SC_NA_1 {
+		t.Errorf("confirmation type = %v, want %v", confirm.Type, asdu.C_SC_NA_1)
+	}
+	if got := confirm.Identifier.Coa.Cause; got != asdu.ActivationCon {
+		t.Errorf("confirmation cause = %v, want %v", got, asdu.ActivationCon)
+	}
+	if confirm.CommonAddr != ca {
+		t.Errorf("confirmation CA = %d, want %d", confirm.CommonAddr, ca)
+	}
+	read(100)
+	conn.wantFrames(t, 3)
+	if got := conn.frame(t, 2).GetSinglePoint(); len(got) != 1 || got[0].Value {
+		t.Fatalf("read back of IOA 100 = %+v, want value false", got)
+	}
+
+	// The float set-point works immediately too and is visible at IOA 301/302.
+	if err := st.OnASDU(conn, request(t, func(c asdu.Connect) error {
+		return asdu.SetpointCmdFloat(c, asdu.C_SE_NC_1, coa(asdu.Activation), ca,
+			asdu.SetpointCommandFloatInfo{Ioa: 301, Value: 42.5})
+	})); err != nil {
+		t.Fatalf("setpoint float command: %v", err)
+	}
+	conn.wantFrames(t, 4)
+	read(301)
+	read(302)
+	conn.wantFrames(t, 6)
+	for i := 0; i < 2; i++ {
+		got := conn.frame(t, 4+i).GetMeasuredValueFloat()
+		if len(got) != 1 || got[0].Value != 42.5 {
+			t.Fatalf("read back frame %d = %+v, want value 42.5", 4+i, got)
+		}
 	}
 }

@@ -9,19 +9,20 @@ This repository contains the **outstation only**. The master that drives it is t
 MSL5 backend's IEC 104 client (the `src/apps/backend/internal/device/iec104/`
 package of the backend repository), which owns the single TCP session and uses a
 small set of object types (see ["What the master sends"](#what-the-master-sends)).
-Everything else in this server — general/counter interrogation, background
-reporting, clock sync, test, reset, delay acquisition — exists so the outstation
-can also be driven by any standard IEC 104 master and regression-tested without
-the backend.
+The outstation **never sends periodic or spontaneous data**: the process image
+changes only through commands and is reported only when asked — `C_RD_NA_1`
+reads, plus the one-shot general/counter interrogation snapshots that non-MSL5
+masters may request. Clock sync, test, reset and delay acquisition are answered so
+any standard IEC 104 master works as well.
 
 ## Layout
 
 ```
 iec104_server/      outstation
   main.go           flags, listener lifecycle, connect/disconnect logging
-  handler.go        CommandHandler: process image, read dispatch, demo reporting
+  handler.go        CommandHandler: process image, command/read dispatch
   confirm.go        fresh-ASDU confirmation/data builders (library workaround)
-  handler_test.go   unit tests: commands, reads, GI/CI sequences, tick behaviour
+  handler_test.go   unit tests: commands, reads, no-GI behaviour, GI/CI snapshots
 build.sh            cross-build a static linux/arm64 binary into dist/ (CGO off)
 pull.sh             token-authenticated fast-forward pull from GitHub (Raspberry Pi)
 deploy/             systemd unit + install.sh / uninstall.sh for the Pi
@@ -49,18 +50,18 @@ The executable name comes from the module path
 (`github.com/alfas/iec104-server`), not from the folder name. There is no
 client binary in this repository any more, so a live session needs a master:
 either the MSL5 backend, or any third-party IEC 104 master pointed at
-`<host>:2404` with common address `1`.
+`<host>:2404`. Answers always carry the **request's** common address (MSL5 uses
+the CA stored per 104 row), so no CA has to be configured on the outstation.
 
 | Flag | Default | Meaning |
 | :-- | :-- | :-- |
 | `-host` | `0.0.0.0` | listen address |
 | `-port` | `2404` | listen port |
-| `-ca` | `1` | common address of unsolicited demo frames (every request-driven answer echoes the request's CA, see below) |
-| `-period` | `3s` | periodic reporting interval (demo path) |
-| `-spontaneous` | `2s` | spontaneous reporting interval (demo path) |
-| `-spontaneous-toggle` | `false` | legacy demo dynamics: flip IOA 100 and drift the analog on every reporting tick; off means reported values only change through commands |
 | `-duration` | `0` | run this long, then exit (`0` = until Ctrl+C / SIGTERM) |
 | `-verbose` | `false` | enable the go-iecp5 library log (frames + decode errors) |
+
+There is deliberately no reporting-interval or common-address flag: the
+outstation has no unsolicited traffic and every answer echoes the request CA.
 
 `-verbose` is the only way to see ASDU decode failures: the library drops a
 frame it cannot decode silently (`sf.Error()` prints nothing unless
@@ -78,25 +79,25 @@ then decodes what the outstation sent back. Covered:
 | `TestCommandsApplyToProcessImage` | `C_SC`/`C_DC`/`C_SE_NA`/`C_SE_NB`/`C_SE_NC`/`C_BO` land in the process image and are confirmed with their own type, COT 7, the request CA and the request IOA |
 | `TestReadAnswersWithNativeTypes` | `C_RD_NA_1` on IOA 100/200/300/301/302/400 answers `M_SP_NA_1` / `M_DP_NA_1` / `M_ME_NA_1` / `M_ME_NC_1` / `M_ME_TF_1` / `M_IT_NA_1` with COT 5 |
 | `TestReadUnknownIOA` | an unmapped IOA is rejected with `C_RD_NA_1` and COT 47 |
-| `TestReadBackAfterCommand` | the write-then-read pattern of the master reads back exactly what the command stored (no reporting tick overwrites it) |
-| `TestInterrogationSequenceEchoesRequestCA` | `ActivationCon(7)` → data with COT 20 → `ActivationTerm(10)`, all on the request CA |
-| `TestCounterInterrogationEchoesRequestCA` | `ActivationCon(7)` → `M_IT_NA_1` COT 37 → `ActivationTerm(10)` |
-| `TestTicksRespectToggleFlag` | reporting ticks only re-publish the process image unless `-spontaneous-toggle` is set |
+| `TestReadBackAfterCommand` | the write-then-read pattern of the master reads back exactly what the command stored (nothing overwrites the process image) |
+| `TestCommandsAndReadsWorkWithoutInterrogation` | a fresh connection that never sent a GI applies commands and answers reads immediately; exact frame counts prove no unsolicited traffic |
+| `TestInterrogationSequenceEchoesRequestCA` | standard-master GI: `ActivationCon(7)` → data with COT 20 → `ActivationTerm(10)`, all on the request CA |
+| `TestCounterInterrogationEchoesRequestCA` | standard-master CI: `ActivationCon(7)` → `M_IT_NA_1` COT 37 → `ActivationTerm(10)` |
 
 ## Process image
 
 One mutex-protected process image (`station` in `handler.go`) backs every
-monitored object. Commands write it, `-spontaneous-toggle` may advance it, and
-reads/interrogations report it.
+monitored object. **Commands are the only writer**; reads and interrogation
+snapshots report it, and no timer or simulation ever touches it.
 
 | IOA | Object | Init | Reported as | Written by |
 | :-- | :-- | :-- | :-- | :-- |
-| 100 | single point `spVal` | `true` | `M_SP_NA_1` (read, GI), `M_SP_TB_1` (spontaneous demo) | `C_SC_NA_1` / `C_SC_TA_1` |
-| 200 | double point `dpVal` | determined on (2) | `M_DP_NA_1` (read, GI) | `C_DC_NA_1` / `C_DC_TA_1` |
-| 300 | normalized measurement | `10000` (= 0.305 per unit) | `M_ME_NA_1` (read, GI) | — (fixed value) |
-| 301 | short float `ana` | `100` | `M_ME_NC_1` (read, GI, periodic demo) | `C_SE_NA_1/TA_1`, `C_SE_NB_1/TB_1`, `C_SE_NC_1/TC_1` |
-| 302 | short float with CP56Time2a | `100` (same `ana`) | `M_ME_TF_1` (read, GI, spontaneous demo) | same as IOA 301 (the analog is shared) |
-| 400 | integrated total `counter` | reading `0`, seq `1` | `M_IT_NA_1` (read, counter interrogation demo) | — (fixed value) |
+| 100 | single point `spVal` | `true` | `M_SP_NA_1` (read, GI snapshot) | `C_SC_NA_1` / `C_SC_TA_1` |
+| 200 | double point `dpVal` | determined on (2) | `M_DP_NA_1` (read, GI snapshot) | `C_DC_NA_1` / `C_DC_TA_1` |
+| 300 | normalized measurement | `10000` (= 0.305 per unit) | `M_ME_NA_1` (read, GI snapshot) | — (fixed value) |
+| 301 | short float `ana` | `100` | `M_ME_NC_1` (read, GI snapshot) | `C_SE_NA_1/TA_1`, `C_SE_NB_1/TB_1`, `C_SE_NC_1/TC_1` |
+| 302 | short float with CP56Time2a | `100` (same `ana`) | `M_ME_TF_1` (read, GI snapshot) | same as IOA 301 (the analog is shared) |
+| 400 | integrated total `counter` | reading `0`, seq `1` | `M_IT_NA_1` (read, counter interrogation) | — (fixed value) |
 
 `C_BO_NA_1` / `C_BO_TA_1` values are stored in a separate `bits` field and are
 not reported as a monitored point (no bitstring type is in the master's model);
@@ -106,8 +107,7 @@ they are confirmed and visible in the log only.
 
 The MSL5 backend uses exactly these objects: single point IOA 100, double point
 IOA 200, analog IOA 301 (and its time-tagged representation 302), plus
-`C_RD_NA_1` reads. Anything else below is for standard masters and regression
-runs.
+`C_RD_NA_1` reads. Anything else below is for standard masters.
 
 | Request | Handler | Effect | Answer |
 | :-- | :-- | :-- | :-- |
@@ -117,8 +117,8 @@ runs.
 | `C_SE_NB_1`, `C_SE_TB_1` | `OnASDU` | `ana = float32(int16 value)` | same type, COT 7 |
 | `C_SE_NC_1`, `C_SE_TC_1` | `OnASDU` | `ana = float32 value` | same type, COT 7 |
 | `C_BO_NA_1`, `C_BO_TA_1` | `OnASDU` | `bits = value` | same type, COT 7 |
-| `C_IC_NA_1` | `OnInterrogation` | starts the demo reporting loops; `Deactivation` answers COT 9 | `C_IC_NA_1` COT 7 → data COT 20 → `C_IC_NA_1` COT 10 |
-| `C_CI_NA_1` | `OnCounterInterrogation` | — | `C_CI_NA_1` COT 7 → `M_IT_NA_1` COT 37 → `C_CI_NA_1` COT 10 |
+| `C_IC_NA_1` | `OnInterrogation` | one-shot snapshot of the process image (MSL5 never sends it); `Deactivation` answers COT 9 | `C_IC_NA_1` COT 7 → data COT 20 → `C_IC_NA_1` COT 10 |
+| `C_CI_NA_1` | `OnCounterInterrogation` | one-shot snapshot of the counter image (MSL5 never sends it) | `C_CI_NA_1` COT 7 → `M_IT_NA_1` COT 37 → `C_CI_NA_1` COT 10 |
 | `C_RD_NA_1` | `OnRead` | reads the image | native type with COT 5, or `C_RD_NA_1` with COT 47 |
 | `C_CS_NA_1` | `OnClockSync` | logs the time | `C_CS_NA_1` COT 7 with the echoed CP56Time2a |
 | `C_TS_NA_1` | `OnTestCommand` | — | `C_TS_NA_1` COT 7 (test word) |
@@ -144,25 +144,20 @@ Command confirmations are always built **after** the value has been stored, so a
 
 ### Common address semantics
 
-`-ca` is the common address of the frames the **demo loops** push on their own
-(periodic/spontaneous). Every **request-driven** answer — confirmations, read
-answers, interrogation data and terminations, the COT 47 rejection — carries the
-common address of the **request**. The master stores its per-point answers under
-`(CA, IOA)`, so hard-coding the outstation CA in answers would file them under a
-CA the master never asked for.
+Every answer — command confirmations, read answers, interrogation data and
+terminations, the COT 47 rejection — carries the common address of the
+**request**. The master stores its per-point answers under `(CA, IOA)` and MSL5
+uses the CA stored per 104 row, so hard-coding an outstation CA would file the
+answers under a CA the master never asked for. There is no outstation-wide CA
+flag.
 
-### Demo/regression paths
+### No unsolicited traffic
 
-Periodic (`M_ME_NC_1` IOA 301, COT 1) and spontaneous (`M_SP_TB_1` IOA 100 and
-`M_ME_TF_1` IOA 302, COT 3) reporting start **only when a general interrogation
-arrives** (i.e. after the STARTDT handshake of a master that interrogates), once
-per session. A master that only writes and reads never sees that traffic, so it
-cannot overwrite a value between a command and its read-back.
-
-Without `-spontaneous-toggle` the ticks just re-publish the process image. With
-the flag the analog drifts by +12.5 per period and wraps to -30 above 220, and
-IOA 100 alternates — the original demo behaviour, which by design overwrites
-commanded values.
+The outstation never initiates a transfer: there is no periodic, spontaneous,
+background or simulated reporting, and no timer writes the process image. Commands
+and reads answer immediately after the connection is up, without a general
+interrogation. A general (or counter) interrogation is answered with a single
+snapshot of the process image if a standard master asks for one; MSL5 never does.
 
 ## Protocol exchanges exercised
 
@@ -176,25 +171,25 @@ commanded values.
 | Reset process | `C_RP_NA_1` | Activation (6) | ActivationCon (7) |
 | Delay acquisition | `C_CD_NA_1` | Activation (6) | ActivationCon (7) |
 | Single / Double / Set-point / Bitstring | `C_SC_*` / `C_DC_*` / `C_SE_*` / `C_BO_*` | Activation (6) | ActivationCon (7) |
-| Periodic data (demo) | `M_ME_NC_1` | Periodic (1) | — |
-| Spontaneous data (demo) | `M_SP_TB_1` + `M_ME_TF_1` | Spontaneous (3) | — |
 
-Interrogation data: `M_SP_NA_1`, `M_DP_NA_1`, `M_ME_NA_1`, `M_ME_NC_1`,
+There are no periodic or spontaneous rows: nothing is sent unless a master asked
+for it. Interrogation data: `M_SP_NA_1`, `M_DP_NA_1`, `M_ME_NA_1`, `M_ME_NC_1`,
 `M_ME_TF_1` (COT 20); counters `M_IT_NA_1` (COT 37).
 
-## Verified run (2026-11-18)
+## Verified run
 
-`go vet ./...`, `go test ./...` and a live TCP session were run on Windows with
-Go 1.27.4. All handler tests pass:
+`gofmt -l .` (clean), `go vet ./...`, `go test ./...` and `go build ./...` were run
+on Windows with Go 1.27.4 after the demo reporting was removed. All handler tests
+pass:
 
 ```text
---- PASS: TestCommandsApplyToProcessImage (0.00s)   # 6 command types
---- PASS: TestReadAnswersWithNativeTypes (0.00s)    # 6 native read answers
+--- PASS: TestCommandsApplyToProcessImage (0.00s)               # 6 command types
+--- PASS: TestReadAnswersWithNativeTypes (0.00s)                # 6 native read answers
 --- PASS: TestReadUnknownIOA (0.00s)
 --- PASS: TestReadBackAfterCommand (0.00s)
---- PASS: TestInterrogationSequenceEchoesRequestCA (0.00s)
---- PASS: TestCounterInterrogationEchoesRequestCA (0.00s)
---- PASS: TestTicksRespectToggleFlag (0.00s)
+--- PASS: TestInterrogationSequenceEchoesRequestCA (0.00s)      # standard-master GI snapshot
+--- PASS: TestCounterInterrogationEchoesRequestCA (0.00s)       # standard-master CI snapshot
+--- PASS: TestCommandsAndReadsWorkWithoutInterrogation (0.00s)  # no GI, no unsolicited frames
 ok  	github.com/alfas/iec104-server
 ```
 
@@ -302,9 +297,8 @@ needs no handler changes.
 | `C_BO_*` bitstring | confirmed and logged, not reported as a monitored point | the master's model has no bitstring point for IOA 400 |
 | `C_RC_NA_1` / `C_RC_TA_1` | logged as unhandled, no confirmation | not implemented |
 | IOA 300 normalized value | constant `10000` (≈0.305 pu) | spare object for standard masters; no command writes it |
-| IOA 400 counter | constant reading `0`, seq `1` | counter interrogation demo only |
-| demo reporting | only starts on a general interrogation, one pair of goroutines per session | keeps a read-after-write session quiet; a monitor master still gets the traffic it asks for |
-| `-spontaneous-toggle` | overwrites commanded values by design | legacy demo dynamics, off by default |
+| IOA 400 counter | constant reading `0`, seq `1` | counter interrogation only; no command writes it |
+| no unsolicited traffic | the outstation only answers requests | keeps a read-after-write session deterministic; process image changes only through commands |
 
 ## Pull / update (`pull.sh`)
 

@@ -8,133 +8,19 @@ import (
 	"github.com/wendy512/go-iecp5/asdu"
 )
 
-// station implements server.CommandHandler and simulates an outstation
-// ("slave") with a small process image and background reporting.
+// station implements server.CommandHandler with a small process image.
+//
+// The process image is the single source of truth: it is written only by the
+// commands handled in OnASDU and read back on request (C_RD_NA_1 and, for
+// standard masters, general/counter interrogation). The outstation never sends
+// periodic or spontaneous data.
 type station struct {
-	// ca is the Common Address of the unsolicited frames produced by the demo
-	// reporting loops (-ca). Every request-driven answer echoes the Common
-	// Address of the request instead, because the MSL5 master stores its answer
-	// payloads per (CA, IOA); no handler below uses this field.
-	ca asdu.CommonAddr
-
 	mu      sync.Mutex
 	spVal   bool
 	dpVal   asdu.DoublePoint
 	ana     float32
 	counter int32
 	bits    uint32 // last C_BO_NA_1 / C_BO_TA_1 bitstring command applied to the process image
-
-	// toggle is -spontaneous-toggle: the legacy demo dynamics (flip IOA 100 and
-	// drift the analog). Off by default, so values written by commands persist.
-	toggle bool
-
-	started sync.Map // remote addr string -> struct{}: one reporting pair per live session
-	period  time.Duration
-	spont   time.Duration
-}
-
-// startReporting launches periodic and spontaneous reporting for a session.
-// It is idempotent per connection address and is invoked from OnInterrogation,
-// i.e. only after the STARTDT handshake is complete.
-func (st *station) startReporting(conn asdu.Connect) {
-	key := conn.UnderlyingConn().RemoteAddr().String()
-	if _, loaded := st.started.LoadOrStore(key, struct{}{}); loaded {
-		return
-	}
-	go st.periodicLoop(conn)
-	go st.spontaneousLoop(conn)
-}
-
-// periodicLoop reports the analog measurement (M_ME_NC_1, COT=1) every
-// -period.
-//
-// It is started from OnInterrogation only, and the MSL5 master never sends a
-// general interrogation, so this traffic exists in demo/regression runs only.
-func (st *station) periodicLoop(conn asdu.Connect) {
-	fails := 0
-	for {
-		time.Sleep(st.period)
-		ana := st.periodicTick()
-		err := asdu.MeasuredValueFloat(conn, false, coa(asdu.Periodic), st.ca,
-			asdu.MeasuredValueFloatInfo{Ioa: 301, Value: ana, Qds: asdu.QDSGood})
-		if err != nil {
-			fails++
-			if fails > 30 {
-				return
-			}
-			continue
-		}
-		fails = 0
-	}
-}
-
-// spontaneousLoop reports the single point (M_SP_TB_1, IOA 100) and the analog
-// with a CP56Time2a tag (M_ME_TF_1, IOA 302), both with COT=3.
-//
-// It is started from OnInterrogation only, so it is demo/regression traffic (see
-// periodicLoop).
-func (st *station) spontaneousLoop(conn asdu.Connect) {
-	fails := 0
-	for {
-		time.Sleep(st.spont)
-		sp, ana := st.spontaneousTick()
-		err := asdu.SingleCP56Time2a(conn, coa(asdu.Spontaneous), st.ca, asdu.SinglePointInfo{
-			Ioa:   100,
-			Value: sp,
-			Qds:   asdu.QDSGood,
-			Time:  time.Now(),
-		})
-		if err == nil {
-			err = sendMeasuredFloatTime(conn, asdu.Spontaneous, st.ca,
-				asdu.MeasuredValueFloatInfo{
-					Ioa:   302,
-					Value: ana,
-					Qds:   asdu.QDSGood,
-					Time:  time.Now(),
-				})
-		}
-		if err != nil {
-			fails++
-			if fails > 30 {
-				return
-			}
-			continue
-		}
-		fails = 0
-	}
-}
-
-// periodicTick advances the process image for one periodic reporting tick and
-// returns the value to report.
-//
-// Without -spontaneous-toggle the process image only changes through commands,
-// so the periodic report repeats the analog written by C_SE_NA_1 / C_SE_NB_1 /
-// C_SE_NC_1. With the legacy demo flag the analog drifts again (+12.5 per tick,
-// wrapped at 220) as in the original demo.
-func (st *station) periodicTick() float32 {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.toggle {
-		st.ana += 12.5
-		if st.ana > 220 {
-			st.ana = -30
-		}
-	}
-	return st.ana
-}
-
-// spontaneousTick advances the process image for one spontaneous reporting tick
-// and returns the values to report.
-//
-// Without -spontaneous-toggle the single point keeps the value written by
-// C_SC_NA_1 / C_DC_NA_1; the flag makes it alternate as in the original demo.
-func (st *station) spontaneousTick() (bool, float32) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.toggle {
-		st.spVal = !st.spVal
-	}
-	return st.spVal, st.ana
 }
 
 // normalizedValue is the fixed process value reported for the normalized
@@ -147,8 +33,9 @@ const normalizedValue asdu.Normalize = 10000
 // short-float measurement (M_ME_NC_1) and the time-tagged short-float
 // measurement (M_ME_TF_1, IOA 302).
 //
-// The general interrogation it answers is a demo/regression path: the MSL5
-// master reads single points instead (C_RD_NA_1), so it never triggers this.
+// This is a one-shot answer to a general interrogation, not a reporting loop.
+// The MSL5 master reads single points instead (C_RD_NA_1), so it never triggers
+// this; it exists so standard masters remain supported.
 func (st *station) sendAllData(conn asdu.Connect, ca asdu.CommonAddr) error {
 	st.mu.Lock()
 	sp, dp, ana := st.spVal, st.dpVal, st.ana
@@ -179,9 +66,9 @@ func (st *station) sendAllData(conn asdu.Connect, ca asdu.CommonAddr) error {
 // sendCounters reports integrated totals with COT=37 (response to a general
 // counter interrogation).
 //
-// Demo/regression path only: the MSL5 master has no counter objects and never
-// sends C_CI_NA_1. The counter image is never modified by commands, so this
-// repeats 0 unless the code is changed.
+// The MSL5 master has no counter objects and never sends C_CI_NA_1; this answer
+// keeps standard masters working. The counter image is never modified by
+// commands, so it reports 0 unless the code is changed.
 func (st *station) sendCounters(conn asdu.Connect, ca asdu.CommonAddr) error {
 	st.mu.Lock()
 	c := st.counter
@@ -193,14 +80,16 @@ func (st *station) sendCounters(conn asdu.Connect, ca asdu.CommonAddr) error {
 		})
 }
 
-// OnInterrogation implements the standard sequence
+// OnInterrogation answers a general interrogation with the standard sequence
 // ActivationCon -> interrogated data -> ActivationTerm.
 //
-// Every frame carries the Common Address of the request.
+// It is a one-shot snapshot of the process image on the request's Common
+// Address. It neither starts nor depends on background reporting: commands and
+// reads work without any interrogation. The MSL5 master never sends a general
+// interrogation, so this path only serves standard masters.
 func (st *station) OnInterrogation(conn asdu.Connect, pack *asdu.ASDU, qoi asdu.QualifierOfInterrogation) error {
 	ca := pack.CommonAddr
 	fmt.Printf("[server] general interrogation: COT=%v QOI=%d CA=%d\n", pack.Identifier.Coa.Cause, qoi, ca)
-	st.startReporting(conn)
 	if pack.Identifier.Coa.Cause == asdu.Deactivation {
 		return confirmInterrogation(conn, asdu.DeactivationCon, ca, qoi)
 	}
@@ -363,7 +252,7 @@ func (st *station) OnASDU(conn asdu.Connect, pack *asdu.ASDU) error {
 }
 
 // applySingle stores a single command in the process image. The IOA is not
-// restricted: the value is what IOA 100 reports (GI and C_RD_NA_1).
+// restricted: the value is what IOA 100 reports (GI snapshot and C_RD_NA_1).
 func (st *station) applySingle(v bool) {
 	st.mu.Lock()
 	st.spVal = v

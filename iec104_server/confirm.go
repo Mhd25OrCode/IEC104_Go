@@ -35,9 +35,9 @@ func newCommandASDU(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca 
 // time tag (M_ME_TF_1) as a brand-new ASDU.
 //
 // It cannot use asdu.MeasuredValueFloatCP56Time2a: that helper accepts only
-// COT Spontaneous(3)/Request(5) and returns ErrCmdCause for Periodic(1) or
-// InterrogatedByStation(20), both of which this outstation needs. The QDS mask
-// (& 0xf1) mirrors the library's own measuredValueFloat() encoder.
+// COT Spontaneous(3)/Request(5) and returns ErrCmdCause for
+// InterrogatedByStation(20), which the general-interrogation answer needs. The
+// QDS mask (& 0xf1) mirrors the library's own measuredValueFloat() encoder.
 func sendMeasuredFloatTime(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr, info asdu.MeasuredValueFloatInfo) error {
 	u := newCommandASDU(conn, asdu.M_ME_TF_1, cause, ca)
 	if err := u.AppendInfoObjAddr(info.Ioa); err != nil {

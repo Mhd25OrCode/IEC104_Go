@@ -388,7 +388,7 @@ the read-only `state`. Nothing is shown read-only either (resolves OQ-4).
 | T2 | IN row `C_SC_NA_1`, digital channel, IOA 100 | outstation log `[server] single command: IOA=100 value=<ch>`, panel shows `C_SC_NA_1` ActivationCon payload |
 | T3 | `C_SE_NC_1` with an analog channel value 42.5, IOA 301 | `[server] setpoint float command: IOA=301 value=42.5` |
 | T4 | `C_BO_NA_1` with value 0x0000000F, IOA 400 | `[server] bitstring32 command`, echo payload |
-| T5 | two rows, same IOA, CA 1 and CA 2 | save accepted, both dispatch with their own CA, payloads stored per (CA, IOA). **Requires outstation change O3** (otherwise the outstation stamps every answer with `-ca`) |
+| T5 | two rows, same IOA, CA 1 and CA 2 | save accepted, both dispatch with their own CA, payloads stored per (CA, IOA). The outstation echoes the request CA (change O3 implemented), so no CA has to be configured on it |
 | T6 | value command, no channel selected | default `true`/`1` is sent (no error) |
 | T7 | row with `C_SE_TC_1`/`C_BO_TA_1` | rejected by the dropdown; a stored legacy row is skipped with an `Info` log |
 | T8 | link not active | HTTP 409 (unchanged, `service.IsNotConnected`) |

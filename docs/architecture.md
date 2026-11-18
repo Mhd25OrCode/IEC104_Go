@@ -7,8 +7,9 @@ Design notes for the IEC 104 outstation in [`iec104_server/`](../iec104_server)
   (IEC 104 transport / cs104 sessions) and
   [`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5) v1.2.5 (ASDU codec),
   Go 1.27, one Go module (`github.com/alfas/iec104-server`).
-- **Transport:** one TCP connection per session, default port **2404**, default
-  demo common address (CA) **1**.
+- **Transport:** one TCP connection per session, default port **2404**; every
+  answer echoes the common address (CA) of the request, so no outstation CA is
+  configured.
 - **Role:** outstation only. The master is the MSL5 backend's IEC 104 client and
   lives in the backend repository; this repository never ships a client binary.
 
@@ -24,8 +25,7 @@ Design notes for the IEC 104 outstation in [`iec104_server/`](../iec104_server)
 │  stores answers per (CA, IOA)│   confirmations (COT 7) and      │                               │
 │                              │   monitoring data (COT 5)        │  main.go     flags, listener  │
 │                              │ ◄─────────────────────────────── │  handler.go  process image,   │
-└──────────────────────────────┘                                  │              handlers, demo  │
-                                                                  │              reporting loops  │
+└──────────────────────────────┘                                  │              handlers, reads  │
                                                                   │  confirm.go  fresh-ASDU       │
                                                                   │              answer builders  │
                                                                   │  handler_test.go  unit tests  │
@@ -33,17 +33,18 @@ Design notes for the IEC 104 outstation in [`iec104_server/`](../iec104_server)
 ```
 
 The outstation is written so that **any** standard master works: general and
-counter interrogation, clock sync, test, reset process, delay acquisition and
-background reporting are all implemented. The MSL5 master uses only a subset
-(commands on IOA 100/200/301 plus reads), which keeps the write-then-read
-verification loop free of unsolicited traffic (see §5).
+counter interrogation (as one-shot snapshots), clock sync, test, reset process and
+delay acquisition are all implemented. **It never initiates a transfer** — no
+periodic, spontaneous or simulated reporting — so the MSL5 master's
+write-then-read verification loop (commands on IOA 100/200/301 plus reads) is free
+of unsolicited traffic (see §5).
 
 ## 2. Files
 
 | File | Responsibility |
 | :-- | :-- |
-| `main.go` | flag parsing (`-host`, `-port`, `-ca`, `-period`, `-spontaneous`, `-spontaneous-toggle`, `-duration`, `-verbose`), building the `station`, `server.New` / `Start` / `Stop`, connect/disconnect logging, duration or SIGINT/SIGTERM shutdown |
-| `handler.go` | `station` type = the process image + all `server.CommandHandler` callbacks (`OnInterrogation`, `OnCounterInterrogation`, `OnRead`, `OnClockSync`, `OnResetProcess`, `OnDelayAcquisition`, `OnTestCommand`, `OnASDU`), the demo reporting loops and the read dispatch |
+| `main.go` | flag parsing (`-host`, `-port`, `-duration`, `-verbose`), building the `station`, `server.New` / `Start` / `Stop`, connect/disconnect logging, duration or SIGINT/SIGTERM shutdown |
+| `handler.go` | `station` type = the process image + all `server.CommandHandler` callbacks (`OnInterrogation`, `OnCounterInterrogation`, `OnRead`, `OnClockSync`, `OnResetProcess`, `OnDelayAcquisition`, `OnTestCommand`, `OnASDU`), the one-shot interrogation snapshots and the read dispatch |
 | `confirm.go` | hand-built answer ASDUs (`confirmInterrogation`, `confirmSingleCmd`, `sendMeasuredFloatTime`, `sendCounterRequest`, `confirmReadError`, …) plus the `coa()` / `newCommandASDU()` helpers |
 | `handler_test.go` | unit tests with a capture `asdu.Connect` implementation (see §8) |
 
@@ -53,7 +54,8 @@ from the session's handler goroutine.
 ## 3. Session lifecycle
 
 1. `server.New(settings, st)` registers `st` as the ASDU handler; `Start()` opens
-   the listener. Nothing is reported before a master connects.
+   the listener. Nothing is sent before a master connects — and nothing is sent
+   unless a master asks for it.
 2. TCP connect → cs104 performs the STARTDT handshake; `main.go` logs
    `[server] client connected: <addr>` via `SetOnConnectionHandler`.
 3. STARTDT activation → the master may send ASDUs. cs104's dispatcher parses the
@@ -72,8 +74,7 @@ from the session's handler goroutine.
 | `C_SC_*`, `C_DC_*`, `C_SE_*`, `C_BO_*`, `C_TS_TA_1` | per-type getter | `OnASDU` |
 
 4. TCP close → `SetConnectionLostHandler` logs `[server] client disconnected`.
-   The demo reporting goroutines of that session stop on their next failed send
-   (each loop gives up after 30 consecutive failures).
+   No goroutine or timer belongs to the session, so nothing is left to clean up.
 5. `s.Stop()` (on `-duration` expiry or SIGINT/SIGTERM) closes the listener.
 
 ## 4. Why every answer is a brand-new ASDU
@@ -105,41 +106,29 @@ Spontaneous/Request, `BitsString32Cmd` only Activation/Deactivation,
 
 ```go
 type station struct {
-	ca      asdu.CommonAddr  // CA of unsolicited demo frames only
 	mu      sync.Mutex
 	spVal   bool             // IOA 100
 	dpVal   asdu.DoublePoint // IOA 200
 	ana     float32          // IOA 301 / 302
 	counter int32            // IOA 400
 	bits    uint32           // last C_BO_* command (not reported)
-	toggle  bool             // -spontaneous-toggle
-	started sync.Map         // remote addr -> struct{} (one reporting pair per session)
-	period, spont time.Duration
 }
 ```
 
 * One mutex protects the image. Handlers lock it only to copy or write values;
   ASDUs are encoded outside the lock.
-* `started` makes `startReporting` idempotent per connection address. It is
-  called from `OnInterrogation` (after the STARTDT handshake) and spawns one
-  periodic and one spontaneous goroutine per session:
-
-  | Loop | Interval | Frames |
-  | :-- | :-- | :-- |
-  | periodic | `-period` | `M_ME_NC_1` IOA 301, COT 1 |
-  | spontaneous | `-spontaneous` | `M_SP_TB_1` IOA 100 + `M_ME_TF_1` IOA 302, COT 3 |
-
-* Both loops give up after 30 consecutive send failures (disconnected master),
-  so they cannot outlive a session for long.
-* `-spontaneous-toggle` is the only writer besides commands: without it the
-  ticks re-publish the image, so a commanded value survives until the next
-  command — that is what makes read-after-write deterministic.
+* **Commands are the only writer.** No timer, goroutine or simulation touches the
+  image, so a commanded value survives until the next command — that is what makes
+  read-after-write deterministic, with no general interrogation needed.
+* Reads and interrogations only copy the image. `OnInterrogation` /
+  `OnCounterInterrogation` answer with one snapshot each (COT 20 / COT 37) and
+  return; they start nothing.
+* Nothing is sent without a request, so a session owns no goroutine and there is
+  nothing to stop when the master disconnects.
 
 ## 6. Common address policy
 
-`-ca` is used **only** for the unsolicited frames the demo loops push.
-Every request-driven answer uses `pack.CommonAddr`, i.e. the CA the master put
-in its request:
+Every answer uses `pack.CommonAddr`, i.e. the CA the master put in its request:
 
 | Handler | CA of the answer |
 | :-- | :-- |
@@ -147,7 +136,6 @@ in its request:
 | `OnRead` (data and COT 47 rejection) | `pack.CommonAddr` |
 | `OnInterrogation` / `OnCounterInterrogation` | `pack.CommonAddr` for ActivationCon, data, ActivationTerm |
 | `OnClockSync` / `OnResetProcess` / `OnDelayAcquisition` / `OnTestCommand` | `pack.CommonAddr` |
-| `periodicLoop` / `spontaneousLoop` | `st.ca` (nobody asked, so the configured CA is the only sensible choice) |
 
 Reason: the master indexes its point values by `(CA, IOA)`. An answer filed under
 a CA the master never used becomes invisible — that was the original defect this
@@ -174,13 +162,13 @@ are hand-built for the same reason as the confirmations (§4).
   helpers, captures the bytes and decodes them again, producing the same
   "already-consumed by the dispatcher" ASDU the server handler receives in
   production.
-* `newTestStation()` uses `time.Hour` reporting intervals, so the demo loops
-  never fire during a test; tick behaviour is unit-tested directly through
-  `periodicTick()` / `spontaneousTick()`.
+* `newTestStation()` builds a station in its power-on state; the outstation has no
+  timers, so a test station is always quiet and needs no interval tuning.
 
 Covered: all six command forms the master can send, the six native read
-answers, the COT 47 rejection, read-after-write, the GI and CI sequences
-(types, causes, CA) and the `-spontaneous-toggle` semantics.
+answers, the COT 47 rejection, read-after-write, that commands and reads work on a
+connection that never sent a GI (exact frame counts prove that no unsolicited
+frame is produced), and the GI/CI snapshots (types, causes, CA).
 
 A live end-to-end check (real TCP listener + `github.com/wendy512/iec104/client`
 master, STARTDT handshake, command → read-back) was run once for the
@@ -217,5 +205,5 @@ predates the removal of the master client from this repository, so its
 * Type IDs 58–64 stay unusable until `go-iecp5` registers them (or a vendored
   copy is patched); the master therefore must use untagged command forms.
 * `C_RC_NA_1` / `C_RC_TA_1` (step commands) are logged but not confirmed.
-* Values are a static demo image (IOA 300 constant, IOA 400 constant); wiring
+* Values are a static process image (IOA 300 constant, IOA 400 constant); wiring
   them to real I/O is out of scope for this test outstation.
