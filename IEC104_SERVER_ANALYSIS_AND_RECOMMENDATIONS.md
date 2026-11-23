@@ -1,15 +1,11 @@
 # Plan — write `IEC104_SERVER_ANALYSIS_AND_RECOMMENDATIONS.md`
 
 ## Context
-The data logger must run an IEC 104 **client** (southbound, already working in MSL5) and an
-IEC 104 **server** (northbound, this repo) at the same time (`docs/data_logger_system_description.md`).
-The server in `iec104_server/` was built as a test outstation for MSL5. It has known library bugs
-and does not support all the ASDUs the gateway needs. The deliverable is **one new Markdown report at the repo root**.
+The data logger run an IEC 104 **client** (already working in MSL5) and an
+IEC 104 **server** (this repo).
+The server in `iec104_server/` was built as a test outstation for MSL5. It has known library bugs in `iec_60870_5_104_bug_report.md` and does not support all the ASDUs the gateway needs. The deliverable is **one new Markdown report at the repo root**.
 No source code is changed. Everything below was verified against the repo and the library sources in the
 module cache (`go-iecp5@v1.2.5`, `iec104@v1.0.4`).
-
-## Deliverable
-Create `c:\Users\alfas\IEC104_Go\IEC104_SERVER_ANALYSIS_AND_RECOMMENDATIONS.md` (only file written). Sections:
 
 1. **Executive summary.** Top blockers, the recommended approach and the roadmap in one page.
 2. **Scope and sources.** Files read, library versions and commit (`2269ee7`), what "verified" means.
@@ -110,7 +106,7 @@ Create `c:\Users\alfas\IEC104_Go\IEC104_SERVER_ANALYSIS_AND_RECOMMENDATIONS.md` 
 - `iec104_server/handler.go`, `confirm.go`, `main.go`, `handler_test.go`, `go.mod`
 - `$GOMODCACHE/github.com/wendy512/go-iecp5@v1.2.5/cs104/server_session.go`, `server.go`, `asdu/asdu.go`, `asdu/codec.go`, `asdu/csys.go`, `asdu/identifier.go`, `asdu/mproc.go`
 - `$GOMODCACHE/github.com/wendy512/iec104@v1.0.4/server/*.go`
-- `README.md`, `docs/architecture.md`, `docs/data_logger_system_description.md`, `iec_60870_5_104_bug_report.md`
+- `README.md`, `docs/architecture.md`, `iec_60870_5_104_bug_report.md`
 
 ## Verification
 - Every claim in the report cites a file:line that has been checked against the sources above.
