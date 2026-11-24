@@ -33,9 +33,9 @@ func newCommandASDU(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca 
 // time tag (M_ME_TF_1) as a brand-new ASDU.
 //
 // It cannot use asdu.MeasuredValueFloatCP56Time2a: that helper accepts only
-// COT Spontaneous(3)/Request(5) and returns ErrCmdCause for
-// InterrogatedByStation(20), which the general-interrogation answer needs. The
-// QDS mask (& 0xf1) mirrors the library's own measuredValueFloat() encoder.
+// COT Spontaneous(3)/Request(5). Like every other outgoing frame here it is
+// hand-built so the cause of transmission stays free. The QDS mask (& 0xf1)
+// mirrors the library's own measuredValueFloat() encoder.
 func sendMeasuredFloatTime(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr, info asdu.MeasuredValueFloatInfo) error {
 	u := newCommandASDU(conn, asdu.M_ME_TF_1, cause, ca)
 	if err := u.AppendInfoObjAddr(info.Ioa); err != nil {
@@ -159,8 +159,8 @@ func confirmSetpointFloat(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Caus
 //
 // It cannot use asdu.IntegratedTotals: that helper accepts only
 // Spontaneous(3) and RequestByGeneralCounter(37)..RequestByGroup4Counter(41),
-// and returns ErrCmdCause for Request(5) - the cause a C_RD_NA_1 answer must
-// carry.
+// so the cause would be fixed. Like every other outgoing frame here it is
+// hand-built to keep the cause free and the encoding in one place.
 func sendCounterRequest(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr, ioa asdu.InfoObjAddr, value asdu.BinaryCounterReading) error {
 	u := newCommandASDU(conn, asdu.M_IT_NA_1, cause, ca)
 	if err := u.AppendInfoObjAddr(ioa); err != nil {

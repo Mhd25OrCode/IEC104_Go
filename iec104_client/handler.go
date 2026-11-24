@@ -7,7 +7,7 @@ import (
 	"github.com/wendy512/go-iecp5/asdu"
 )
 
-// station is the process image of the dialling outstation.
+// station is the process image of the dialling client (outstation).
 //
 // The image is written by the commands handled in OnASDU and reported to the
 // MSL5 server by the reporter (spontaneous frames). General/counter
@@ -29,7 +29,7 @@ type station struct {
 //
 // cs104 would answer a non-nil handler error with a mirror of the request built
 // from an ASDU whose info-object buffer was already consumed by Get*Cmd(), so
-// it would arrive truncated (see iec_60870_5_104_bug_report.md §1-§4). Logging
+// it would arrive truncated (see docs/iec104_library_bug_report.md §1). Logging
 // the failure here keeps the wire clean.
 func replyOrLog(err error) {
 	if err != nil {

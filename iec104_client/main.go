@@ -40,7 +40,7 @@ func main() {
 	if err := cli.Start(); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("IEC 104 outstation dialling MSL5 at %s (CA %d, reconnect %v)", addr, *ca, *reconnect)
+	log.Printf("IEC 104 client (outstation) dialling MSL5 at %s (CA %d, reconnect %v)", addr, *ca, *reconnect)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if *duration > 0 {

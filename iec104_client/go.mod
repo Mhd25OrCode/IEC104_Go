@@ -1,4 +1,4 @@
-module github.com/alfas/iec104-server
+module github.com/alfas/iec104-client
 
 go 1.27.1
 

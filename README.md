@@ -1,18 +1,17 @@
-# IEC 60870-5-104 Outstation, dialling client (Go)
+# IEC 60870-5-104 Client (Outstation), Go
 
-A minimal IEC 60870-5-104 ("IEC 104") **outstation that acts as the TCP client**,
-written in Go on [`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5)
+A minimal IEC 60870-5-104 ("IEC 104") **client that acts as the controlled
+outstation**, written in Go on [`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5)
 v1.2.5 (`cs104` transport + ASDU codec).
 
-The roles of the earlier versions are reversed at the TCP level: **MSL5 is the
-IEC 104 server** and listens on a port; **this program dials MSL5**, sends
-STARTDT, **reports its process image as spontaneous `M_*` frames** (COT 3) and
-**answers the control commands MSL5 sends cyclically** (`C_SC`, `C_DC`, `C_SE`,
-`C_BO`) with `ActivationCon` (COT 7) followed by `ActivationTerm` (COT 10).
-On the application level it stays the *controlled station*: it owns the process
-image and MSL5 commands it. There is no general interrogation, counter
-interrogation, read, clock sync, test or reset handling; such requests are
-ignored (logged with `-verbose`) and never answered.
+**MSL5 is the IEC 104 server** and listens on a port; **this program is the TCP
+client that dials MSL5**, sends STARTDT, **reports its process image as
+spontaneous `M_*` frames** (COT 3) and **answers the control commands MSL5 sends
+cyclically** (`C_SC`, `C_DC`, `C_SE`, `C_BO`) with `ActivationCon` (COT 7)
+followed by `ActivationTerm` (COT 10). On the application level it is the
+*controlled station*: it owns the process image and MSL5 commands it. There is
+no general interrogation, counter interrogation, read, clock sync, test or reset
+handling; such requests are ignored (logged with `-verbose`) and never answered.
 
 Run exactly **one** instance per MSL5: MSL5 keeps one session ("newest wins"), so
 two instances kick each other out through auto-reconnect.
@@ -20,7 +19,7 @@ two instances kick each other out through auto-reconnect.
 ## Layout
 
 ```
-iec104_server/        dialling outstation
+iec104_client/        IEC 104 client (outstation)
   main.go             flags, newClient() wiring (STARTDT, connect/lost handlers), shutdown
   client_handler.go   cs104.ClientHandlerInterface adapter (commands -> station, rest ignored)
   handler.go          station: process image, command dispatch, ActCon + ActTerm
@@ -30,9 +29,8 @@ iec104_server/        dialling outstation
   loopback_test.go    client against a real cs104 server on 127.0.0.1
 build.sh              cross-build a static linux/arm64 binary into dist/ (CGO off)
 pull.sh               token-authenticated fast-forward pull from GitHub (Raspberry Pi)
-deploy/               systemd unit + install.sh / uninstall.sh for the Pi
-docs/                 architecture.md
-iec104-vk-implementation-handoff.md   migration plan this implementation follows
+deploy/               systemd unit iec104-client.service + install.sh / uninstall.sh
+docs/                 architecture.md, iec104_library_bug_report.md
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the design.
@@ -40,15 +38,15 @@ See [`docs/architecture.md`](docs/architecture.md) for the design.
 ## Build & run
 
 ```powershell
-cd iec104_server
-go build ./...        # writes .\iec104-server.exe
+cd iec104_client
+go build ./...        # writes .\iec104-client.exe
 go test ./...         # unit + loopback tests (loopback binds 127.0.0.1 on a free port)
 
 # dial MSL5 on the same machine, run until Ctrl+C (or pass -duration 60s)
-.\iec104-server.exe -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1
+.\iec104-client.exe -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1
 
 # same, with the library's frame/decode log
-.\iec104-server.exe -msl5-host 192.168.1.10 -ca 1 -verbose
+.\iec104-client.exe -msl5-host 192.168.1.10 -ca 1 -verbose
 ```
 
 | Flag | Default | Meaning |
@@ -113,7 +111,7 @@ CA + IOA + exact command type, so the confirmations echo the **request's** CA.
 
 ## Tests
 
-`go test ./...` in `iec104_server/`:
+`go test ./...` in `iec104_client/`:
 
 | Test | Checks |
 | :-- | :-- |
@@ -144,9 +142,7 @@ CA + IOA + exact command type, so the confirmations echo the **request's** CA.
 
 `asdu.infoObjSize` has no entry for Type IDs 58–64 (`C_SC_TA_1` … `C_BO_TA_1`),
 so frames of those types are dropped by the library before any handler runs.
-MSL5 never sends them. Details: [`iec_60870_5_104_bug_report.md`](iec_60870_5_104_bug_report.md).
-`IEC104_SERVER_ANALYSIS_AND_RECOMMENDATIONS.md` is kept as history; its GI/CI/RD/CS
-findings no longer apply to this scope.
+MSL5 never sends them. Details: [`docs/iec104_library_bug_report.md`](docs/iec104_library_bug_report.md).
 
 ## End-to-end with MSL5
 
@@ -154,7 +150,7 @@ findings no longer apply to this scope.
    `{"enabled":true,"ipAddress":"0.0.0.0","port":2404}` (state `listening`).
 2. Create an OUT row (CA 1, IOA 301, `asduRetTyp` `M_ME_NC_1`, linked analog
    channel) and an IN row (`C_SC_NA_1`, CA 1, IOA 100, interval `5 sek`).
-3. Start `iec104-server -msl5-host <msl5-ip> -msl5-port 2404 -ca 1 -verbose`.
+3. Start `iec104-client -msl5-host <msl5-ip> -msl5-port 2404 -ca 1 -verbose`.
 
 Expected: MSL5 reports `connected`, then `active` after the first frame; the OUT
 row's `responsePayload` updates every `-spont-interval`; the IN row shows
@@ -208,12 +204,12 @@ The CM4 is Cortex-A72 (ARMv8-A, AArch64), so the `GOARCH=arm64` binary from
 `build.sh` is natively supported; a 32-bit (armhf) OS is not supported and fails
 with `Exec format error` (verify with `uname -m`, which must print `aarch64`).
 
-The outstation runs on the same board as MSL5. It does not listen on any port: it
+The client runs on the same board as MSL5. It does not listen on any port: it
 dials MSL5, which owns `2404` (default `-msl5-host 127.0.0.1 -msl5-port 2404`).
 
 ### Prerequisites
 
-Go **1.27.1** (the version pinned in `iec104_server/go.mod`) must be available.
+Go **1.27.1** (the version pinned in `iec104_client/go.mod`) must be available.
 Debian 13 ships Go 1.24, which is too old, so either:
 
 ```bash
@@ -237,10 +233,10 @@ go version    # go1.27.1 linux/arm64
 Builds a static arm64 ELF binary (CGO disabled, no runtime deps):
 
 ```text
-dist/iec104-server
+dist/iec104-client
 ```
 
-`file dist/iec104-server` should report `ELF 64-bit LSB executable, ARM aarch64`.
+`file dist/iec104-client` should report `ELF 64-bit LSB executable, ARM aarch64`.
 The same script works as a cross-build from Windows/WSL when a Go 1.27.1
 toolchain is present.
 
@@ -254,15 +250,15 @@ sudo ./deploy/install.sh
 ```
 
 The installer creates an `iec104` system user, copies the binary to
-`/opt/iec104/`, installs `deploy/iec104-server.service` into
+`/opt/iec104/`, installs `deploy/iec104-client.service` into
 `/etc/systemd/system/`, then runs `daemon-reload` and `enable --now`. It also
-removes the legacy master units and binary (`iec104-client.service`,
-`iec104-client-demo.service`, `/opt/iec104/iec104-client`) left behind by older
-deployments of this repository, so nothing competes for the MSL5 session.
+removes the legacy outstation-server unit and binary (`iec104-server.service`,
+`/opt/iec104/iec104-server`) left behind by older deployments of this
+repository, so nothing competes for the MSL5 session.
 
 ```bash
-systemctl status iec104-server
-journalctl -u iec104-server -f
+systemctl status iec104-client
+journalctl -u iec104-client -f
 ```
 
 The unit runs with `Restart=always` as the non-root `iec104` user (it only makes
@@ -271,7 +267,7 @@ outgoing connections). The library reconnects by itself; the unit is the safety 
 ### Smoke test (binary directly, no systemd)
 
 ```bash
-./dist/iec104-server -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1 -duration 20s &
+./dist/iec104-client -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1 -duration 20s &
 # MSL5 (or any IEC 104 server) must be listening on that port
 ```
 
@@ -281,17 +277,12 @@ outgoing connections). The library reconnects by itself; the unit is the safety 
 sudo ./deploy/uninstall.sh
 ```
 
-Stops and disables the unit (plus the legacy client units), removes the unit
+Stops and disables the unit (plus the legacy server unit), removes the unit
 files and deletes `/opt/iec104/`.
 
 ## Documentation
 
 * [`docs/architecture.md`](docs/architecture.md) — file responsibilities,
-  dispatch and confirmation flow, concurrency, testing approach.
-* [`iec104-vk-implementation-handoff.md`](iec104-vk-implementation-handoff.md)
-  — the migration plan this client implementation follows.
-* [`docs/iec104_test_outstation_change_plan.md`](docs/iec104_test_outstation_change_plan.md)
-  — superseded plan of the former server role.
-* [`iec_60870_5_104_bug_report.md`](iec_60870_5_104_bug_report.md) — library
-  bug analysis. Historical: it was written against an earlier layout that still
-  contained a master client, which has since been removed from this repository.
+  dispatch and confirmation flow, concurrency, MSL5 contract, testing approach.
+* [`docs/iec104_library_bug_report.md`](docs/iec104_library_bug_report.md) —
+  the two go-iecp5 defects this client works around.
