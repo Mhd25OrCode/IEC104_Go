@@ -1,19 +1,24 @@
 package main
 
 import (
+	"errors"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/wendy512/go-iecp5/asdu"
+	"github.com/wendy512/go-iecp5/cs104"
 )
 
 // captureConn is the asdu.Connect implementation used by the tests. It records
-// every frame the station sends and never touches a real socket, so the
-// assertions can inspect type, cause, CA, IOA and value on the wire.
+// every frame the station sends and never touches a real socket.
 type captureConn struct {
-	params *asdu.Params
-	frames [][]byte
-	conn   net.Conn
+	mu      sync.Mutex
+	params  *asdu.Params
+	frames  [][]byte
+	conn    net.Conn
+	sendErr error
 }
 
 func newCaptureConn(t *testing.T) *captureConn {
@@ -29,6 +34,11 @@ func newCaptureConn(t *testing.T) *captureConn {
 func (c *captureConn) Params() *asdu.Params { return c.params }
 
 func (c *captureConn) Send(u *asdu.ASDU) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sendErr != nil {
+		return c.sendErr
+	}
 	raw, err := u.MarshalBinary()
 	if err != nil {
 		return err
@@ -39,9 +49,16 @@ func (c *captureConn) Send(u *asdu.ASDU) error {
 
 func (c *captureConn) UnderlyingConn() net.Conn { return c.conn }
 
-// frame decodes the i-th frame captured from the station.
+func (c *captureConn) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.frames)
+}
+
 func (c *captureConn) frame(t *testing.T, i int) *asdu.ASDU {
 	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if i >= len(c.frames) {
 		t.Fatalf("frame %d missing, station sent %d", i, len(c.frames))
 	}
@@ -54,13 +71,13 @@ func (c *captureConn) frame(t *testing.T, i int) *asdu.ASDU {
 
 func (c *captureConn) wantFrames(t *testing.T, n int) {
 	t.Helper()
-	if len(c.frames) != n {
-		t.Fatalf("station sent %d frames, want %d", len(c.frames), n)
+	if got := c.count(); got != n {
+		t.Fatalf("station sent %d frames, want %d", got, n)
 	}
 }
 
-// request builds a master-to-outstation frame with the library helper and
-// decodes it again, so handlers receive exactly what a master would send.
+// request builds a master-to-outstation frame and decodes it again, so handlers
+// receive exactly what MSL5 would send.
 func request(t *testing.T, build func(c asdu.Connect) error) *asdu.ASDU {
 	t.Helper()
 	master := newCaptureConn(t)
@@ -70,8 +87,6 @@ func request(t *testing.T, build func(c asdu.Connect) error) *asdu.ASDU {
 	return master.frame(t, 0)
 }
 
-// newTestStation returns a station in its power-on state. The outstation has no
-// timers or background reporting, so a test station is always quiet.
 func newTestStation() *station {
 	return &station{
 		spVal: true,
@@ -80,7 +95,6 @@ func newTestStation() *station {
 	}
 }
 
-// commandIOA returns the IOA a command confirmation echoes.
 func commandIOA(sf *asdu.ASDU) asdu.InfoObjAddr {
 	switch sf.Type {
 	case asdu.C_SC_NA_1:
@@ -99,9 +113,9 @@ func commandIOA(sf *asdu.ASDU) asdu.InfoObjAddr {
 	return asdu.InfoObjAddrIrrelevant
 }
 
-// TestCommandsApplyToProcessImage checks that each command type used by the MSL5
-// master is stored in the process image and confirmed with its own type, COT 7
-// and the CA of the request (never a configured outstation CA).
+// TestCommandsApplyToProcessImage checks that each command type used by MSL5 is
+// stored and answered with exactly ActivationCon then ActivationTerm on the
+// request CA.
 func TestCommandsApplyToProcessImage(t *testing.T) {
 	const ca asdu.CommonAddr = 7
 
@@ -122,7 +136,7 @@ func TestCommandsApplyToProcessImage(t *testing.T) {
 			ioa: 100,
 			check: func(t *testing.T, st *station) {
 				if st.spVal {
-					t.Fatal("spVal = true, want false (command not applied)")
+					t.Fatal("spVal = true, want false")
 				}
 			},
 		},
@@ -150,7 +164,7 @@ func TestCommandsApplyToProcessImage(t *testing.T) {
 			ioa: 301,
 			check: func(t *testing.T, st *station) {
 				if st.ana != 42 {
-					t.Fatalf("ana = %v, want 42 (raw int16, no 1/32768 scaling)", st.ana)
+					t.Fatalf("ana = %v, want 42", st.ana)
 				}
 			},
 		},
@@ -201,364 +215,233 @@ func TestCommandsApplyToProcessImage(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newTestStation()
+			kicks := 0
+			st.onChange = func() { kicks++ }
 			conn := newCaptureConn(t)
 			if err := st.OnASDU(conn, request(t, tc.build)); err != nil {
 				t.Fatalf("OnASDU: %v", err)
 			}
 			tc.check(t, st)
+			if kicks != 1 {
+				t.Errorf("report kicked %d times, want 1", kicks)
+			}
 
-			conn.wantFrames(t, 1)
-			sf := conn.frame(t, 0)
-			if sf.Type != tc.typ {
-				t.Errorf("confirmation type = %v, want %v", sf.Type, tc.typ)
-			}
-			if got := sf.Identifier.Coa.Cause; got != asdu.ActivationCon {
-				t.Errorf("confirmation cause = %v, want %v", got, asdu.ActivationCon)
-			}
-			if sf.CommonAddr != ca {
-				t.Errorf("confirmation CA = %d, want %d", sf.CommonAddr, ca)
-			}
-			if got := commandIOA(sf); got != tc.ioa {
-				t.Errorf("confirmation IOA = %d, want %d", got, tc.ioa)
+			conn.wantFrames(t, 2)
+			for i, want := range []asdu.Cause{asdu.ActivationCon, asdu.ActivationTerm} {
+				sf := conn.frame(t, i)
+				if sf.Type != tc.typ {
+					t.Errorf("frame %d type = %v, want %v", i, sf.Type, tc.typ)
+				}
+				if got := sf.Identifier.Coa.Cause; got != want {
+					t.Errorf("frame %d cause = %v, want %v", i, got, want)
+				}
+				if sf.CommonAddr != ca {
+					t.Errorf("frame %d CA = %d, want %d", i, sf.CommonAddr, ca)
+				}
+				if got := commandIOA(sf); got != tc.ioa {
+					t.Errorf("frame %d IOA = %d, want %d", i, got, tc.ioa)
+				}
 			}
 		})
 	}
 }
 
-// TestReadAnswersWithNativeTypes checks that a read command is answered with the
-// ASDU type of the addressed object, COT 5 and the CA of the request.
-func TestReadAnswersWithNativeTypes(t *testing.T) {
-	const ca asdu.CommonAddr = 9
+// TestOutOfScopeRequestsAreNotAnswered feeds interrogation, counter
+// interrogation, read and clock sync requests into the handler.
+func TestOutOfScopeRequestsAreNotAnswered(t *testing.T) {
+	const ca asdu.CommonAddr = 5
+	h := &clientHandler{st: newTestStation()}
+	conn := newCaptureConn(t)
 
-	cases := []struct {
-		name  string
-		ioa   asdu.InfoObjAddr
-		typ   asdu.TypeID
-		check func(t *testing.T, sf *asdu.ASDU)
+	reqs := []struct {
+		name   string
+		build  func(c asdu.Connect) error
+		handle func(*asdu.ASDU) error
 	}{
-		{
-			name: "IOA 100 single point",
-			ioa:  100,
-			typ:  asdu.M_SP_NA_1,
-			check: func(t *testing.T, sf *asdu.ASDU) {
-				got := sf.GetSinglePoint()
-				if len(got) != 1 || got[0].Ioa != 100 || !got[0].Value {
-					t.Fatalf("single point = %+v, want IOA 100 value true", got)
-				}
-			},
-		},
-		{
-			name: "IOA 200 double point",
-			ioa:  200,
-			typ:  asdu.M_DP_NA_1,
-			check: func(t *testing.T, sf *asdu.ASDU) {
-				got := sf.GetDoublePoint()
-				if len(got) != 1 || got[0].Ioa != 200 || got[0].Value != asdu.DPIDeterminedOn {
-					t.Fatalf("double point = %+v, want IOA 200 value %v", got, asdu.DPIDeterminedOn)
-				}
-			},
-		},
-		{
-			name: "IOA 300 normalized measurement",
-			ioa:  300,
-			typ:  asdu.M_ME_NA_1,
-			check: func(t *testing.T, sf *asdu.ASDU) {
-				got := sf.GetMeasuredValueNormal()
-				if len(got) != 1 || got[0].Value != normalizedValue {
-					t.Fatalf("normalized = %+v, want value %d", got, normalizedValue)
-				}
-			},
-		},
-		{
-			name: "IOA 301 short float",
-			ioa:  301,
-			typ:  asdu.M_ME_NC_1,
-			check: func(t *testing.T, sf *asdu.ASDU) {
-				got := sf.GetMeasuredValueFloat()
-				if len(got) != 1 || got[0].Value != 100 {
-					t.Fatalf("short float = %+v, want value 100", got)
-				}
-			},
-		},
-		{
-			name: "IOA 302 time-tagged short float",
-			ioa:  302,
-			typ:  asdu.M_ME_TF_1,
-			check: func(t *testing.T, sf *asdu.ASDU) {
-				got := sf.GetMeasuredValueFloat()
-				if len(got) != 1 || got[0].Value != 100 || got[0].Time.IsZero() {
-					t.Fatalf("time-tagged float = %+v, want value 100 with CP56Time2a", got)
-				}
-			},
-		},
-		{
-			name: "IOA 400 integrated total",
-			ioa:  400,
-			typ:  asdu.M_IT_NA_1,
-			check: func(t *testing.T, sf *asdu.ASDU) {
-				got := sf.GetIntegratedTotals()
-				if len(got) != 1 || got[0].Value.CounterReading != 0 || got[0].Value.SeqNumber != 1 {
-					t.Fatalf("integrated total = %+v, want reading 0 seq 1", got)
-				}
-			},
-		},
+		{"C_IC_NA_1", func(c asdu.Connect) error {
+			return asdu.InterrogationCmd(c, coa(asdu.Activation), ca, asdu.QOIStation)
+		}, func(p *asdu.ASDU) error { return h.InterrogationHandler(conn, p) }},
+		{"C_CI_NA_1", func(c asdu.Connect) error {
+			return asdu.CounterInterrogationCmd(c, coa(asdu.Activation), ca, asdu.QualifierCountCall{Request: asdu.QCCTotal})
+		}, func(p *asdu.ASDU) error { return h.CounterInterrogationHandler(conn, p) }},
+		{"C_RD_NA_1", func(c asdu.Connect) error {
+			return asdu.ReadCmd(c, coa(asdu.Request), ca, 100)
+		}, func(p *asdu.ASDU) error { return h.ReadHandler(conn, p) }},
+		{"C_CS_NA_1", func(c asdu.Connect) error {
+			return asdu.ClockSynchronizationCmd(c, coa(asdu.Activation), ca, time.Now())
+		}, func(p *asdu.ASDU) error { return h.ClockSyncHandler(conn, p) }},
 	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			st := newTestStation()
-			conn := newCaptureConn(t)
-			pack := request(t, func(c asdu.Connect) error {
-				return asdu.ReadCmd(c, coa(asdu.Request), ca, tc.ioa)
-			})
-			if err := st.OnRead(conn, pack, tc.ioa); err != nil {
-				t.Fatalf("OnRead: %v", err)
-			}
-			conn.wantFrames(t, 1)
-			sf := conn.frame(t, 0)
-			if sf.Type != tc.typ {
-				t.Errorf("read answer type = %v, want %v", sf.Type, tc.typ)
-			}
-			if got := sf.Identifier.Coa.Cause; got != asdu.Request {
-				t.Errorf("read answer cause = %v, want %v", got, asdu.Request)
-			}
-			if sf.CommonAddr != ca {
-				t.Errorf("read answer CA = %d, want %d", sf.CommonAddr, ca)
-			}
-			tc.check(t, sf)
-		})
+	for _, r := range reqs {
+		if err := r.handle(request(t, r.build)); err != nil {
+			t.Errorf("%s: handler returned %v, want nil", r.name, err)
+		}
 	}
+	conn.wantFrames(t, 0)
 }
 
-// TestReadUnknownIOA checks that an unmapped IOA is rejected with C_RD_NA_1 and
-// COT 47 (unknown information object address) instead of an invented value.
-func TestReadUnknownIOA(t *testing.T) {
-	const ca asdu.CommonAddr = 9
-	const ioa asdu.InfoObjAddr = 9999
-
-	st := newTestStation()
-	conn := newCaptureConn(t)
-	pack := request(t, func(c asdu.Connect) error {
-		return asdu.ReadCmd(c, coa(asdu.Request), ca, ioa)
-	})
-	if err := st.OnRead(conn, pack, ioa); err != nil {
-		t.Fatalf("OnRead: %v", err)
-	}
-
-	conn.wantFrames(t, 1)
-	sf := conn.frame(t, 0)
-	if sf.Type != asdu.C_RD_NA_1 {
-		t.Errorf("rejection type = %v, want %v", sf.Type, asdu.C_RD_NA_1)
-	}
-	if got := sf.Identifier.Coa.Cause; got != asdu.UnknownIOA {
-		t.Errorf("rejection cause = %v, want %v", got, asdu.UnknownIOA)
-	}
-	if sf.CommonAddr != ca {
-		t.Errorf("rejection CA = %d, want %d", sf.CommonAddr, ca)
-	}
-	if got := sf.GetReadCmd(); got != ioa {
-		t.Errorf("rejection IOA = %d, want %d", got, ioa)
-	}
+func newTestReporter(t *testing.T, conn asdu.Connect, st *station, cyclic bool) *reporter {
+	t.Helper()
+	return newReporter(st, conn, 3, 0, cyclic)
 }
 
-// TestReadBackAfterCommand follows the write-then-read verification pattern of
-// docs/iec104_test_outstation_change_plan.md: the value stored by the command is
-// what the following read reports (the process image is the only source of
-// truth and nothing overwrites it).
-func TestReadBackAfterCommand(t *testing.T) {
-	const ca asdu.CommonAddr = 3
+// TestReportAllFrames checks the six spontaneous frames in table order.
+func TestReportAllFrames(t *testing.T) {
 	st := newTestStation()
 	conn := newCaptureConn(t)
+	newTestReporter(t, conn, st, false).reportAll()
 
-	steps := []func() error{
-		func() error {
-			return st.OnASDU(conn, request(t, func(c asdu.Connect) error {
-				return asdu.SingleCmd(c, asdu.C_SC_NA_1, coa(asdu.Activation), ca,
-					asdu.SingleCommandInfo{Ioa: 100, Value: false})
-			}))
-		},
-		func() error {
-			return st.OnRead(conn, request(t, func(c asdu.Connect) error {
-				return asdu.ReadCmd(c, coa(asdu.Request), ca, 100)
-			}), 100)
-		},
-		func() error {
-			return st.OnASDU(conn, request(t, func(c asdu.Connect) error {
-				return asdu.SetpointCmdFloat(c, asdu.C_SE_NC_1, coa(asdu.Activation), ca,
-					asdu.SetpointCommandFloatInfo{Ioa: 301, Value: 42.5})
-			}))
-		},
-		func() error {
-			return st.OnRead(conn, request(t, func(c asdu.Connect) error {
-				return asdu.ReadCmd(c, coa(asdu.Request), ca, 301)
-			}), 301)
-		},
-	}
-	for i, step := range steps {
-		if err := step(); err != nil {
-			t.Fatalf("step %d: %v", i, err)
-		}
-	}
-
-	conn.wantFrames(t, 4)
-	sp := conn.frame(t, 1).GetSinglePoint()
-	if len(sp) != 1 || sp[0].Value {
-		t.Fatalf("read back of IOA 100 = %+v, want value false", sp)
-	}
-	ana := conn.frame(t, 3).GetMeasuredValueFloat()
-	if len(ana) != 1 || ana[0].Value != 42.5 {
-		t.Fatalf("read back of IOA 301 = %+v, want value 42.5", ana)
-	}
-}
-
-// TestInterrogationSequenceEchoesRequestCA checks the standard general
-// interrogation snapshot: ActivationCon -> data (COT 20) -> ActivationTerm, all
-// on the CA of the request instead of a configured CA. The MSL5 master does not
-// send a GI; this path exists for standard masters only.
-func TestInterrogationSequenceEchoesRequestCA(t *testing.T) {
-	const ca asdu.CommonAddr = 5
-	st := newTestStation()
-	conn := newCaptureConn(t)
-
-	pack := request(t, func(c asdu.Connect) error {
-		return asdu.InterrogationCmd(c, coa(asdu.Activation), ca, asdu.QOIStation)
-	})
-	if err := st.OnInterrogation(conn, pack, asdu.QOIStation); err != nil {
-		t.Fatalf("OnInterrogation: %v", err)
-	}
-
-	conn.wantFrames(t, 7)
-	wantTypes := []asdu.TypeID{
-		asdu.C_IC_NA_1,
-		asdu.M_SP_NA_1,
-		asdu.M_DP_NA_1,
-		asdu.M_ME_NA_1,
-		asdu.M_ME_NC_1,
-		asdu.M_ME_TF_1,
-		asdu.C_IC_NA_1,
-	}
-	wantCauses := []asdu.Cause{
-		asdu.ActivationCon,
-		asdu.InterrogatedByStation,
-		asdu.InterrogatedByStation,
-		asdu.InterrogatedByStation,
-		asdu.InterrogatedByStation,
-		asdu.InterrogatedByStation,
-		asdu.ActivationTerm,
-	}
-	for i := range wantTypes {
-		sf := conn.frame(t, i)
-		if sf.Type != wantTypes[i] {
-			t.Errorf("frame %d type = %v, want %v", i, sf.Type, wantTypes[i])
-		}
-		if got := sf.Identifier.Coa.Cause; got != wantCauses[i] {
-			t.Errorf("frame %d cause = %v, want %v", i, got, wantCauses[i])
-		}
-		if sf.CommonAddr != ca {
-			t.Errorf("frame %d CA = %d, want %d", i, sf.CommonAddr, ca)
-		}
-	}
-}
-
-// TestCounterInterrogationEchoesRequestCA checks the counter-interrogation
-// standard-master path: C_CI ActivationCon, M_IT_NA_1 with COT 37, C_CI
-// ActivationTerm, all on the CA of the request.
-func TestCounterInterrogationEchoesRequestCA(t *testing.T) {
-	const ca asdu.CommonAddr = 5
-	st := newTestStation()
-	conn := newCaptureConn(t)
-
-	qcc := asdu.QualifierCountCall{Request: asdu.QCCTotal}
-	pack := request(t, func(c asdu.Connect) error {
-		return asdu.CounterInterrogationCmd(c, coa(asdu.Activation), ca, qcc)
-	})
-	_, gotQCC := pack.GetCounterInterrogationCmd()
-	if err := st.OnCounterInterrogation(conn, pack, gotQCC); err != nil {
-		t.Fatalf("OnCounterInterrogation: %v", err)
-	}
-
-	conn.wantFrames(t, 3)
-	wantTypes := []asdu.TypeID{asdu.C_CI_NA_1, asdu.M_IT_NA_1, asdu.C_CI_NA_1}
-	wantCauses := []asdu.Cause{asdu.ActivationCon, asdu.RequestByGeneralCounter, asdu.ActivationTerm}
-	for i := range wantTypes {
-		sf := conn.frame(t, i)
-		if sf.Type != wantTypes[i] {
-			t.Errorf("frame %d type = %v, want %v", i, sf.Type, wantTypes[i])
-		}
-		if got := sf.Identifier.Coa.Cause; got != wantCauses[i] {
-			t.Errorf("frame %d cause = %v, want %v", i, got, wantCauses[i])
-		}
-		if sf.CommonAddr != ca {
-			t.Errorf("frame %d CA = %d, want %d", i, sf.CommonAddr, ca)
-		}
-	}
-}
-
-// TestCommandsAndReadsWorkWithoutInterrogation pins the no-GI requirement: on a
-// fresh connection that never sent a general interrogation, commands are applied
-// and reads answer immediately. The exact frame counts prove that no periodic,
-// spontaneous or other unsolicited frame is produced.
-func TestCommandsAndReadsWorkWithoutInterrogation(t *testing.T) {
-	const ca asdu.CommonAddr = 4
-	st := newTestStation()
-	conn := newCaptureConn(t)
-
-	read := func(ioa asdu.InfoObjAddr) {
-		t.Helper()
-		if err := st.OnRead(conn, request(t, func(c asdu.Connect) error {
-			return asdu.ReadCmd(c, coa(asdu.Request), ca, ioa)
-		}), ioa); err != nil {
-			t.Fatalf("read IOA %d: %v", ioa, err)
-		}
-	}
-
-	// The process image is readable before any command and without a GI.
-	read(100)
-	conn.wantFrames(t, 1)
-	if got := conn.frame(t, 0).GetSinglePoint(); len(got) != 1 || !got[0].Value {
-		t.Fatalf("initial read of IOA 100 = %+v, want value true", got)
-	}
-
-	// A single command works immediately and is confirmed with COT 7 on the
-	// request CA.
-	if err := st.OnASDU(conn, request(t, func(c asdu.Connect) error {
-		return asdu.SingleCmd(c, asdu.C_SC_NA_1, coa(asdu.Activation), ca,
-			asdu.SingleCommandInfo{Ioa: 100, Value: false})
-	})); err != nil {
-		t.Fatalf("single command: %v", err)
-	}
-	conn.wantFrames(t, 2)
-	confirm := conn.frame(t, 1)
-	if confirm.Type != asdu.C_SC_NA_1 {
-		t.Errorf("confirmation type = %v, want %v", confirm.Type, asdu.C_SC_NA_1)
-	}
-	if got := confirm.Identifier.Coa.Cause; got != asdu.ActivationCon {
-		t.Errorf("confirmation cause = %v, want %v", got, asdu.ActivationCon)
-	}
-	if confirm.CommonAddr != ca {
-		t.Errorf("confirmation CA = %d, want %d", confirm.CommonAddr, ca)
-	}
-	read(100)
-	conn.wantFrames(t, 3)
-	if got := conn.frame(t, 2).GetSinglePoint(); len(got) != 1 || got[0].Value {
-		t.Fatalf("read back of IOA 100 = %+v, want value false", got)
-	}
-
-	// The float set-point works immediately too and is visible at IOA 301/302.
-	if err := st.OnASDU(conn, request(t, func(c asdu.Connect) error {
-		return asdu.SetpointCmdFloat(c, asdu.C_SE_NC_1, coa(asdu.Activation), ca,
-			asdu.SetpointCommandFloatInfo{Ioa: 301, Value: 42.5})
-	})); err != nil {
-		t.Fatalf("setpoint float command: %v", err)
-	}
-	conn.wantFrames(t, 4)
-	read(301)
-	read(302)
 	conn.wantFrames(t, 6)
-	for i := 0; i < 2; i++ {
-		got := conn.frame(t, 4+i).GetMeasuredValueFloat()
-		if len(got) != 1 || got[0].Value != 42.5 {
-			t.Fatalf("read back frame %d = %+v, want value 42.5", 4+i, got)
+	wantTypes := []asdu.TypeID{asdu.M_SP_NA_1, asdu.M_DP_NA_1, asdu.M_ME_NC_1, asdu.M_ME_TF_1, asdu.M_ME_NB_1, asdu.M_IT_NA_1}
+	wantIOAs := []asdu.InfoObjAddr{100, 200, 301, 302, 303, 400}
+	for i := range wantTypes {
+		sf := conn.frame(t, i)
+		if sf.Type != wantTypes[i] {
+			t.Errorf("frame %d type = %v, want %v", i, sf.Type, wantTypes[i])
+		}
+		if got := sf.Identifier.Coa.Cause; got != asdu.Spontaneous {
+			t.Errorf("frame %d cause = %v, want Spontaneous", i, got)
+		}
+		if sf.CommonAddr != 3 {
+			t.Errorf("frame %d CA = %d, want 3", i, sf.CommonAddr)
+		}
+		var ioa asdu.InfoObjAddr
+		switch sf.Type {
+		case asdu.M_SP_NA_1:
+			ioa = sf.GetSinglePoint()[0].Ioa
+		case asdu.M_DP_NA_1:
+			ioa = sf.GetDoublePoint()[0].Ioa
+		case asdu.M_ME_NC_1:
+			ioa = sf.GetMeasuredValueFloat()[0].Ioa
+		case asdu.M_ME_TF_1:
+			got := sf.GetMeasuredValueFloat()[0]
+			ioa = got.Ioa
+			if got.Time.IsZero() {
+				t.Error("M_ME_TF_1 has no time tag")
+			}
+		case asdu.M_ME_NB_1:
+			ioa = sf.GetMeasuredValueScaled()[0].Ioa
+		case asdu.M_IT_NA_1:
+			ioa = sf.GetIntegratedTotals()[0].Ioa
+		}
+		if ioa != wantIOAs[i] {
+			t.Errorf("frame %d IOA = %d, want %d", i, ioa, wantIOAs[i])
+		}
+	}
+}
+
+// TestReportUsesImageValues checks reported values follow the process image,
+// the counter and the int16 clamp.
+func TestReportUsesImageValues(t *testing.T) {
+	st := newTestStation()
+	st.spVal = false
+	st.dpVal = asdu.DPIIndeterminateOrIntermediate // 3 must be reported as 0/1
+	st.ana = 70000
+	st.counter = 9
+	conn := newCaptureConn(t)
+	newTestReporter(t, conn, st, false).reportAll()
+
+	if got := conn.frame(t, 0).GetSinglePoint()[0].Value; got {
+		t.Error("single point = true, want false")
+	}
+	if got := conn.frame(t, 1).GetDoublePoint()[0].Value; got != asdu.DPIDeterminedOn {
+		t.Errorf("double point = %v, want %v", got, asdu.DPIDeterminedOn)
+	}
+	if got := conn.frame(t, 2).GetMeasuredValueFloat()[0].Value; got != 70000 {
+		t.Errorf("float = %v, want 70000", got)
+	}
+	if got := conn.frame(t, 4).GetMeasuredValueScaled()[0].Value; got != 32767 {
+		t.Errorf("scaled = %v, want 32767 (clamped)", got)
+	}
+	if got := conn.frame(t, 5).GetIntegratedTotals()[0].Value.CounterReading; got != 9 {
+		t.Errorf("counter = %v, want 9", got)
+	}
+}
+
+func TestCyclicModeOnlyForMeasurements(t *testing.T) {
+	conn := newCaptureConn(t)
+	newTestReporter(t, conn, newTestStation(), true).reportAll()
+
+	conn.wantFrames(t, 6)
+	for i, want := range []asdu.Cause{
+		asdu.Spontaneous, asdu.Spontaneous, asdu.Periodic, asdu.Spontaneous, asdu.Periodic, asdu.Spontaneous,
+	} {
+		if got := conn.frame(t, i).Identifier.Coa.Cause; got != want {
+			t.Errorf("frame %d cause = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestReporterDoesNotSendWhenStopped(t *testing.T) {
+	st := newTestStation()
+	conn := newCaptureConn(t)
+	rep := newTestReporter(t, conn, st, false)
+	rep.Kick()
+	rep.Stop()
+	time.Sleep(2 * kickDebounce)
+	conn.wantFrames(t, 0)
+}
+
+func TestReporterStartStopIdempotent(t *testing.T) {
+	conn := newCaptureConn(t)
+	rep := newReporter(newTestStation(), conn, 1, 20*time.Millisecond, false)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rep.Start()
+			rep.Stop()
+			rep.Start()
+		}()
+	}
+	wg.Wait()
+	rep.Start()
+	time.Sleep(100 * time.Millisecond)
+	rep.Stop()
+	rep.Stop()
+
+	n := conn.count()
+	if n == 0 || n%6 != 0 {
+		t.Fatalf("sent %d frames, want a positive multiple of 6", n)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if got := conn.count(); got != n {
+		t.Fatalf("frames still sent after Stop: %d -> %d", n, got)
+	}
+}
+
+func TestReporterKickReportsChange(t *testing.T) {
+	conn := newCaptureConn(t)
+	rep := newReporter(newTestStation(), conn, 1, 0, false)
+	rep.Start()
+	defer rep.Stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for conn.count() < 6 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	conn.wantFrames(t, 6)
+	rep.Kick()
+	for conn.count() < 12 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	conn.wantFrames(t, 12)
+}
+
+func TestSendErrorsAreNotFatal(t *testing.T) {
+	for _, sendErr := range []error{cs104.ErrNotActive, cs104.ErrBufferFulled, cs104.ErrUseClosedConnection, errors.New("boom")} {
+		conn := newCaptureConn(t)
+		conn.sendErr = sendErr
+		rep := newTestReporter(t, conn, newTestStation(), false)
+		rep.reportAll()
+
+		st := newTestStation()
+		pack := request(t, func(c asdu.Connect) error {
+			return asdu.SingleCmd(c, asdu.C_SC_NA_1, coa(asdu.Activation), 1,
+				asdu.SingleCommandInfo{Ioa: 100, Value: false})
+		})
+		if err := st.OnASDU(conn, pack); err != nil {
+			t.Errorf("OnASDU with send error %v returned %v, want nil", sendErr, err)
 		}
 	}
 }

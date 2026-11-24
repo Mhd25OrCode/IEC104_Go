@@ -1,209 +1,149 @@
-# IEC 60870-5-104 Outstation — Architecture
+# IEC 60870-5-104 Outstation (dialling client) — Architecture
 
-Design notes for the IEC 104 outstation in [`iec104_server/`](../iec104_server)
-(see also the root [`README.md`](../README.md)).
+Design notes for [`iec104_server/`](../iec104_server) (see also the root
+[`README.md`](../README.md) and the migration plan
+[`iec104-vk-implementation-handoff.md`](../iec104-vk-implementation-handoff.md)).
 
-- **Library stack:** [`wendy512/iec104`](https://github.com/wendy512/iec104) v1.0.4
-  (IEC 104 transport / cs104 sessions) and
-  [`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5) v1.2.5 (ASDU codec),
-  Go 1.27, one Go module (`github.com/alfas/iec104-server`).
-- **Transport:** one TCP connection per session, default port **2404**; every
-  answer echoes the common address (CA) of the request, so no outstation CA is
-  configured.
-- **Role:** outstation only. The master is the MSL5 backend's IEC 104 client and
-  lives in the backend repository; this repository never ships a client binary.
+- **Library:** [`wendy512/go-iecp5`](https://github.com/wendy512/go-iecp5) v1.2.5
+  (`cs104` transport + ASDU codec), Go 1.27, module `github.com/alfas/iec104-server`.
+  `wendy512/iec104` is no longer used.
+- **Transport:** this program is the **TCP client**. It dials MSL5 (IEC 104
+  server, default port 2404) and reconnects forever.
+- **Role:** *controlled station* on the application level: it owns the process
+  image, reports it spontaneously and answers MSL5's control commands.
 
 ---
 
 ## 1. Scope
 
 ```text
-┌──────────────────────────────┐        TCP 2404 (IEC 104)        ┌───────────────────────────────┐
-│ MSL5 backend (external)      │ ◄──────────────────────────────► │ iec104-server (this repo)     │
-│  master / controlling station│   C_SC, C_DC, C_SE_*, C_RD_NA_1  │  outstation / controlled      │
-│                              │ ───────────────────────────────► │  station                      │
-│  stores answers per (CA, IOA)│   confirmations (COT 7) and      │                               │
-│                              │   monitoring data (COT 5)        │  main.go     flags, listener  │
-│                              │ ◄─────────────────────────────── │  handler.go  process image,   │
-└──────────────────────────────┘                                  │              handlers, reads  │
-                                                                  │  confirm.go  fresh-ASDU       │
-                                                                  │              answer builders  │
-                                                                  │  handler_test.go  unit tests  │
-                                                                  └───────────────────────────────┘
+  VK (this repo)                                     MSL5 (IEC 104 server)
+  TCP client, controlled station                     TCP server, controlling station
+      ── TCP connect ───────────────────────────────►
+      ── STARTDT act ───────────────────────────────►
+      ◄─ STARTDT con ────────────────────────────────
+      ── M_* COT 3 (spontaneous, full image) ───────►   matched by CA + IOA + type
+      ◄─ C_* COT 6 (activation, cyclic) ─────────────
+      ── C_* COT 7 (ActCon), C_* COT 10 (ActTerm) ──►   stored on the IN row
+      ── M_* COT 3 (report of the changed image) ───►
 ```
 
-The outstation is written so that **any** standard master works: general and
-counter interrogation (as one-shot snapshots), clock sync, test, reset process and
-delay acquisition are all implemented. **It never initiates a transfer** — no
-periodic, spontaneous or simulated reporting — so the MSL5 master's
-write-then-read verification loop (commands on IOA 100/200/301 plus reads) is free
-of unsolicited traffic (see §5).
+Only spontaneous/cyclic data and control commands exist. General interrogation,
+counter interrogation, read, clock sync, test, reset process and delay
+acquisition are out of scope: the handlers log (with `-verbose`) and return `nil`,
+never answering.
 
 ## 2. Files
 
 | File | Responsibility |
 | :-- | :-- |
-| `main.go` | flag parsing (`-host`, `-port`, `-duration`, `-verbose`), building the `station`, `server.New` / `Start` / `Stop`, connect/disconnect logging, duration or SIGINT/SIGTERM shutdown |
-| `handler.go` | `station` type = the process image + all `server.CommandHandler` callbacks (`OnInterrogation`, `OnCounterInterrogation`, `OnRead`, `OnClockSync`, `OnResetProcess`, `OnDelayAcquisition`, `OnTestCommand`, `OnASDU`), the one-shot interrogation snapshots and the read dispatch |
-| `confirm.go` | hand-built answer ASDUs (`confirmInterrogation`, `confirmSingleCmd`, `sendMeasuredFloatTime`, `sendCounterRequest`, `confirmReadError`, …) plus the `coa()` / `newCommandASDU()` helpers |
-| `handler_test.go` | unit tests with a capture `asdu.Connect` implementation (see §8) |
-
-`server.CommandHandler` is satisfied by `*station`; the library calls its methods
-from the session's handler goroutine.
+| `main.go` | flags (`-msl5-host`, `-msl5-port`, `-ca`, `-spont-interval`, `-cyclic`, `-reconnect`, `-duration`, `-verbose`), `newClient()` wiring, shutdown on `-duration` or SIGINT/SIGTERM |
+| `client_handler.go` | `clientHandler`: `cs104.ClientHandlerInterface` adapter; `ASDUHandler` → `station.OnASDU`, all other handlers ignore |
+| `handler.go` | `station` = process image, `OnASDU` command dispatch, `apply*`, ActCon + ActTerm |
+| `confirm.go` | hand-built ASDUs: `confirm*` command echoes (cause is a parameter), `sendMeasuredFloatTime`, `sendCounterRequest`, `coa()`, `newCommandASDU()` |
+| `reporter.go` | `reporter`: Start/Stop/Kick, `reportAll`, send-error handling |
+| `handler_test.go`, `loopback_test.go` | unit tests (capture connection) and a loopback test against a real `cs104.Server` |
 
 ## 3. Session lifecycle
 
-1. `server.New(settings, st)` registers `st` as the ASDU handler; `Start()` opens
-   the listener. Nothing is sent before a master connects — and nothing is sent
-   unless a master asks for it.
-2. TCP connect → cs104 performs the STARTDT handshake; `main.go` logs
-   `[server] client connected: <addr>` via `SetOnConnectionHandler`.
-3. STARTDT activation → the master may send ASDUs. cs104's dispatcher parses the
-   frame, **calls the matching `Get*Cmd()` getter itself**, then invokes the
-   handler:
+1. `cs104.Client.Start()` returns immediately; the library dials, and on failure
+   or loss reconnects every `-reconnect` (plus ~0.5–1 s).
+2. `SetOnConnectHandler` → `SendStartDt()`. MSL5 never sends STARTDT, and the
+   library drops I-frames before it.
+3. `SetServerActiveHandler` fires when STARTDT is confirmed → `reporter.Start()`.
+   `Send` returns `ErrNotActive` before that, so nothing is sent earlier.
+4. `SetConnectionLostHandler` → `reporter.Stop()`. Both callbacks can fire many
+   times; `Start`/`Stop` are idempotent and goroutine-safe (`Stop` waits for the
+   loop to exit).
+5. Routing of received frames: `C_IC/C_CI/C_RD/C_CS/C_TS/C_RP/C_CD` go to the
+   dedicated (ignoring) handlers, everything else, including all
+   `C_SC/C_DC/C_SE/C_BO`, goes to `ASDUHandler`. Handlers run on one goroutine
+   per session and must not block.
 
-| Request | Dispatcher getter | Handler |
-| :-- | :-- | :-- |
-| `C_IC_NA_1` | `GetInterrogationCmd` | `OnInterrogation` |
-| `C_CI_NA_1` | `GetCounterInterrogationCmd` | `OnCounterInterrogation` |
-| `C_RD_NA_1` | `GetReadCmd` | `OnRead` |
-| `C_CS_NA_1` | `GetClockSynchronizationCmd` | `OnClockSync` |
-| `C_RP_NA_1` | `GetResetProcessCmd` | `OnResetProcess` |
-| `C_CD_NA_1` | `GetDelayAcquireCommand` | `OnDelayAcquisition` |
-| `C_TS_NA_1` | `GetTestCommand` | `OnTestCommand` |
-| `C_SC_*`, `C_DC_*`, `C_SE_*`, `C_BO_*`, `C_TS_TA_1` | per-type getter | `OnASDU` |
-
-4. TCP close → `SetConnectionLostHandler` logs `[server] client disconnected`.
-   No goroutine or timer belongs to the session, so nothing is left to clean up.
-5. `s.Stop()` (on `-duration` expiry or SIGINT/SIGTERM) closes the listener.
+MSL5 keeps one session (newest wins): run exactly one instance per MSL5.
 
 ## 4. Why every answer is a brand-new ASDU
 
-The `Get*Cmd()` getters are destructive: they advance the ASDU's internal
-information-object buffer. Because the dispatcher already called one of them,
-`SendReplyMirror()` in a handler would encode an empty/truncated body and the
-master would report `asdu UnmarshalBinary failed, EOF`. cs104 additionally
-answers any non-nil handler error with `SendReplyMirror(UnknownTypeID)`.
+The `Get*Cmd()` getters consume the ASDU's information-object buffer, so
+`SendReplyMirror()` after parsing would send a truncated body. Therefore:
 
-The rule enforced by `confirm.go` and `handler.go`:
-
-1. parse the request with `pack.Get*Cmd()` **only** to read parameters;
+1. parse with `pack.Get*Cmd()` only to read parameters;
 2. store the effect in the process image;
-3. build a fresh `asdu.ASDU` (`asdu.NewASDU(conn.Params(), Identifier{…})` +
-   `AppendInfoObjAddr` + `Append*`), set the cause and the request's common
-   address, and `conn.Send` it;
-4. never return a send error to the dispatcher — `replyOrLog()` logs it and
+3. build a fresh ASDU (`newCommandASDU` + `AppendInfoObjAddr` + `Append*`) with
+   the requested cause and the **request's** CA, and `conn.Send` it — first
+   `ActivationCon`, then `ActivationTerm`;
+4. never return a send error to the library: `replyOrLog` logs it and the handler
    returns `nil`.
 
-`newCommandASDU()` is the shared constructor:
-`VariableStruct{IsSequence: false, Number: 1}`, `coa(cause)` and the given CA.
-Hand-building is also required because several library helpers restrict the
-cause of transmission (`MeasuredValueFloatCP56Time2a` accepts only
-Spontaneous/Request, `BitsString32Cmd` only Activation/Deactivation,
-`IntegratedTotals` only counter-interrogation causes).
+Hand-building is also required where library helpers restrict the cause
+(`BitsString32Cmd`, `MeasuredValueFloatCP56Time2a`, `IntegratedTotals`).
 
-## 5. Process image and concurrency
+## 5. Process image, reporter and concurrency
 
 ```go
 type station struct {
-	mu      sync.Mutex
-	spVal   bool             // IOA 100
-	dpVal   asdu.DoublePoint // IOA 200
-	ana     float32          // IOA 301 / 302
-	counter int32            // IOA 400
-	bits    uint32           // last C_BO_* command (not reported)
+	mu       sync.Mutex
+	spVal    bool             // IOA 100
+	dpVal    asdu.DoublePoint // IOA 200
+	ana      float32          // IOA 301 / 302 / 303
+	counter  int32            // IOA 400
+	bits     uint32           // last C_BO_* command (not reported)
+	onChange func()           // reporter.Kick, called outside mu
 }
 ```
 
-* One mutex protects the image. Handlers lock it only to copy or write values;
-  ASDUs are encoded outside the lock.
-* **Commands are the only writer.** No timer, goroutine or simulation touches the
-  image, so a commanded value survives until the next command — that is what makes
-  read-after-write deterministic, with no general interrogation needed.
-* Reads and interrogations only copy the image. `OnInterrogation` /
-  `OnCounterInterrogation` answer with one snapshot each (COT 20 / COT 37) and
-  return; they start nothing.
-* Nothing is sent without a request, so a session owns no goroutine and there is
-  nothing to stop when the master disconnects.
+* `st.mu` protects the image and is **never held during `Send`**: `reportAll`
+  snapshots the image, releases the lock, then sends.
+* The reporter loop runs while the session is active: full image on start, on
+  every `-spont-interval` tick (the counter is incremented first), and after a
+  command via `Kick` with a 100 ms debounce. `Kick` is a non-blocking write to a
+  1-buffered channel.
+* Frames (COT 3, CA `-ca`, one object per ASDU): `M_SP_NA_1` 100, `M_DP_NA_1` 200
+  (0/1 only), `M_ME_NC_1` 301, `M_ME_TF_1` 302, `M_ME_NB_1` 303 (clamped int16),
+  `M_IT_NA_1` 400. `M_ME_NA_1` is never reported. With `-cyclic` only
+  `M_ME_NC_1`/`M_ME_NB_1` use COT 1 (the other helpers reject it).
+* A failed send aborts the report round: `ErrNotActive`/`ErrUseClosedConnection`
+  silently, `ErrBufferFulled` with a warning.
 
 ## 6. Common address policy
 
-Every answer uses `pack.CommonAddr`, i.e. the CA the master put in its request:
+Spontaneous frames use `-ca` (one CA for all of them). Command confirmations echo
+`pack.CommonAddr`, because MSL5 matches IN rows by CA + IOA + command type.
 
-| Handler | CA of the answer |
-| :-- | :-- |
-| `OnASDU` (all `C_*` commands, `C_TS_TA_1`) | `pack.CommonAddr`, echoed into every confirmation |
-| `OnRead` (data and COT 47 rejection) | `pack.CommonAddr` |
-| `OnInterrogation` / `OnCounterInterrogation` | `pack.CommonAddr` for ActivationCon, data, ActivationTerm |
-| `OnClockSync` / `OnResetProcess` / `OnDelayAcquisition` / `OnTestCommand` | `pack.CommonAddr` |
+## 7. Testing approach
 
-Reason: the master indexes its point values by `(CA, IOA)`. An answer filed under
-a CA the master never used becomes invisible — that was the original defect this
-outstation had to fix.
+* `captureConn` implements `asdu.Connect` and records marshalled frames; `request()`
+  builds a frame with the library's `asdu.*Cmd` helpers and decodes it again, giving
+  handlers the same "consumed" ASDU they see in production.
+* Unit tests cover commands (exactly ActCon then ActTerm, request CA, image
+  update, report kick), ignored requests, the six reported frames, image values,
+  `-cyclic`, reporter lifecycle under `-race`, and send errors.
+* `loopback_test.go` runs the real `newClient` wiring against a `cs104.Server` on
+  a free `127.0.0.1` port: STARTDT, spontaneous image, command → ActCon/ActTerm →
+  changed report, and reconnect to a restarted server.
 
-## 7. Read dispatch
-
-`OnRead` switches on the IOA and answers with the ASDU type the object actually
-has (`M_SP_NA_1` 100, `M_DP_NA_1` 200, `M_ME_NA_1` 300, `M_ME_NC_1` 301,
-`M_ME_TF_1` 302, `M_IT_NA_1` 400), all with COT 5 (`Request`). Any other IOA is
-answered with `C_RD_NA_1` carrying COT 47 (`UnknownIOA`), so the master can show
-a rejection instead of a fabricated value. `M_ME_TF_1` and `M_IT_NA_1` answers
-are hand-built for the same reason as the confirmations (§4).
-
-## 8. Testing approach
-
-`handler_test.go` avoids sockets and ports entirely:
-
-* `captureConn` implements `asdu.Connect` (`Params()`, `Send()`,
-  `UnderlyingConn()`); `Send` marshals the ASDU to bytes and appends it to a
-  slice, so every test can decode exactly what went on the wire.
-* `request()` does the opposite direction: it builds a master frame with the
-  library's own `asdu.SingleCmd`, `asdu.ReadCmd`, `asdu.InterrogationCmd`, …
-  helpers, captures the bytes and decodes them again, producing the same
-  "already-consumed by the dispatcher" ASDU the server handler receives in
-  production.
-* `newTestStation()` builds a station in its power-on state; the outstation has no
-  timers, so a test station is always quiet and needs no interval tuning.
-
-Covered: all six command forms the master can send, the six native read
-answers, the COT 47 rejection, read-after-write, that commands and reads work on a
-connection that never sent a GI (exact frame counts prove that no unsolicited
-frame is produced), and the GI/CI snapshots (types, causes, CA).
-
-A live end-to-end check (real TCP listener + `github.com/wendy512/iec104/client`
-master, STARTDT handshake, command → read-back) was run once for the
-2026-11-18 verification documented in the root README; it is intentionally not
-part of the committed suite because it binds a port.
-
-## 9. Packaging and deployment
+## 8. Packaging and deployment
 
 | Path | Purpose |
 | :-- | :-- |
 | `build.sh` | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w"` → `dist/iec104-server` |
-| `deploy/iec104-server.service` | systemd unit: `User=iec104`, `ExecStart=/opt/iec104/iec104-server -host 0.0.0.0 -port 2404`, `Restart=always`, enabled at boot |
-| `deploy/install.sh` | creates the `iec104` user, installs binary + unit, removes legacy master units/binary, `daemon-reload`, `enable --now` |
-| `deploy/uninstall.sh` | stops/disables the unit (and legacy client units), removes unit files and `/opt/iec104` |
-| `pull.sh` | token-authenticated `git fetch` + `--ff-only` merge on the Pi, token read from `$HOME/.iec104-git-token` |
+| `deploy/iec104-server.service` | systemd unit: `User=iec104`, `ExecStart=/opt/iec104/iec104-server -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1`, `Restart=always`, `RestartSec=2` |
+| `deploy/install.sh` | creates the `iec104` user, installs binary + unit, removes legacy master units, `enable --now` |
+| `deploy/uninstall.sh` | stops/disables the unit, removes unit files and `/opt/iec104` |
+| `pull.sh` | token-authenticated `git fetch` + `--ff-only` merge on the Pi |
 
-`dist/` and `logs/` are gitignored, so a pull never overwrites build output.
+The program no longer listens, so it can share a device with MSL5, which owns
+port 2404.
 
-## 10. Library defects that shaped the code
+## 9. Library limitations
 
-| # | Defect | Mitigation here |
-| :-- | :-- | :-- |
-| 1 | `Get*Cmd()` consumes the ASDU; `SendReplyMirror()` then encodes an empty body | fresh ASDU for every answer; `replyOrLog()` keeps handler errors away from the dispatcher's mirror |
-| 2 | bundled example never implemented the GI sequence | `OnInterrogation` sends ActivationCon → data (COT 20) → ActivationTerm |
-| 3 | `asdu.infoObjSize` lacks Type IDs 58–64 (`C_SC_TA_1` … `C_BO_TA_1`) → receiver drops those frames | untagged forms are used/supported; tagged branches stay in place for a patched/vendored library |
+`asdu.infoObjSize` lacks Type IDs 58–64 (`C_*_TA/TB/TC`): the library drops such
+frames before any handler runs. MSL5 never sends them; the tagged branches stay in
+`OnASDU` for a patched library. See
+[`iec_60870_5_104_bug_report.md`](../iec_60870_5_104_bug_report.md).
 
-Details, A/B evidence and upstream commit references:
-[`iec_60870_5_104_bug_report.md`](../iec_60870_5_104_bug_report.md). That report
-predates the removal of the master client from this repository, so its
-"client side" observations describe the external master.
+## 10. Open items
 
-## 11. Open items
-
-* Type IDs 58–64 stay unusable until `go-iecp5` registers them (or a vendored
-  copy is patched); the master therefore must use untagged command forms.
-* `C_RC_NA_1` / `C_RC_TA_1` (step commands) are logged but not confirmed.
-* Values are a static process image (IOA 300 constant, IOA 400 constant); wiring
-  them to real I/O is out of scope for this test outstation.
+* `C_RC_*` (step commands) are logged as unhandled, not confirmed.
+* The image is static apart from commands and the `M_IT` counter; wiring it to
+  real I/O is out of scope.

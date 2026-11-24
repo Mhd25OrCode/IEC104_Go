@@ -1,8 +1,6 @@
 package main
 
 import (
-	"time"
-
 	"github.com/wendy512/go-iecp5/asdu"
 )
 
@@ -48,76 +46,12 @@ func sendMeasuredFloatTime(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAd
 	return conn.Send(u)
 }
 
-// confirmInterrogation sends a C_IC_NA_1 confirmation/termination
-// (ActivationCon / ActivationTerm respectively).
-func confirmInterrogation(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr, qoi asdu.QualifierOfInterrogation) error {
-	u := newCommandASDU(conn, asdu.C_IC_NA_1, cause, ca)
-	if err := u.AppendInfoObjAddr(asdu.InfoObjAddrIrrelevant); err != nil {
-		return err
-	}
-	u.AppendBytes(byte(qoi))
-	return conn.Send(u)
-}
-
-// confirmCounterInterrogation sends a C_CI_NA_1 confirmation/termination.
-func confirmCounterInterrogation(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr, qcc asdu.QualifierCountCall) error {
-	u := newCommandASDU(conn, asdu.C_CI_NA_1, cause, ca)
-	if err := u.AppendInfoObjAddr(asdu.InfoObjAddrIrrelevant); err != nil {
-		return err
-	}
-	u.AppendBytes(qcc.Value())
-	return conn.Send(u)
-}
-
-// confirmClockSync sends a C_CS_NA_1 activation confirmation carrying the
-// synchronization time received in the request.
-func confirmClockSync(conn asdu.Connect, ca asdu.CommonAddr, t time.Time) error {
-	u := newCommandASDU(conn, asdu.C_CS_NA_1, asdu.ActivationCon, ca)
-	if err := u.AppendInfoObjAddr(asdu.InfoObjAddrIrrelevant); err != nil {
-		return err
-	}
-	u.AppendCP56Time2a(t, conn.Params().InfoObjTimeZone)
-	return conn.Send(u)
-}
-
-// confirmResetProcess sends a C_RP_NA_1 activation confirmation.
-func confirmResetProcess(conn asdu.Connect, ca asdu.CommonAddr, qrp asdu.QualifierOfResetProcessCmd) error {
-	u := newCommandASDU(conn, asdu.C_RP_NA_1, asdu.ActivationCon, ca)
-	if err := u.AppendInfoObjAddr(asdu.InfoObjAddrIrrelevant); err != nil {
-		return err
-	}
-	u.AppendBytes(byte(qrp))
-	return conn.Send(u)
-}
-
-// confirmDelayAcquire sends a C_CD_NA_1 activation confirmation.
-func confirmDelayAcquire(conn asdu.Connect, ca asdu.CommonAddr, msec uint16) error {
-	u := newCommandASDU(conn, asdu.C_CD_NA_1, asdu.ActivationCon, ca)
-	if err := u.AppendInfoObjAddr(asdu.InfoObjAddrIrrelevant); err != nil {
-		return err
-	}
-	u.AppendCP16Time2a(msec)
-	return conn.Send(u)
-}
-
-// confirmTestCommand sends a C_TS_TA_1 activation confirmation with the
-// standard test word and CP56Time2a timestamp.
-func confirmTestCommand(conn asdu.Connect, ca asdu.CommonAddr, t time.Time) error {
-	u := newCommandASDU(conn, asdu.C_TS_TA_1, asdu.ActivationCon, ca)
-	if err := u.AppendInfoObjAddr(asdu.InfoObjAddrIrrelevant); err != nil {
-		return err
-	}
-	u.AppendUint16(asdu.FBPTestWord)
-	u.AppendCP56Time2a(t, conn.Params().InfoObjTimeZone)
-	return conn.Send(u)
-}
-
 // confirmSingleCmd echoes a single command as an activation confirmation.
-func confirmSingleCmd(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr, cmd asdu.SingleCommandInfo) error {
+func confirmSingleCmd(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca asdu.CommonAddr, cmd asdu.SingleCommandInfo) error {
 	if typeID != asdu.C_SC_NA_1 && typeID != asdu.C_SC_TA_1 {
 		return asdu.ErrTypeIDNotMatch
 	}
-	u := newCommandASDU(conn, typeID, asdu.ActivationCon, ca)
+	u := newCommandASDU(conn, typeID, cause, ca)
 	if err := u.AppendInfoObjAddr(cmd.Ioa); err != nil {
 		return err
 	}
@@ -133,11 +67,11 @@ func confirmSingleCmd(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr,
 }
 
 // confirmDoubleCmd echoes a double command as an activation confirmation.
-func confirmDoubleCmd(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr, cmd asdu.DoubleCommandInfo) error {
+func confirmDoubleCmd(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca asdu.CommonAddr, cmd asdu.DoubleCommandInfo) error {
 	if typeID != asdu.C_DC_NA_1 && typeID != asdu.C_DC_TA_1 {
 		return asdu.ErrTypeIDNotMatch
 	}
-	u := newCommandASDU(conn, typeID, asdu.ActivationCon, ca)
+	u := newCommandASDU(conn, typeID, cause, ca)
 	if err := u.AppendInfoObjAddr(cmd.Ioa); err != nil {
 		return err
 	}
@@ -150,11 +84,11 @@ func confirmDoubleCmd(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr,
 
 // confirmSetpointNormal echoes a normalized set-point command as an
 // activation confirmation.
-func confirmSetpointNormal(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr, cmd asdu.SetpointCommandNormalInfo) error {
+func confirmSetpointNormal(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca asdu.CommonAddr, cmd asdu.SetpointCommandNormalInfo) error {
 	if typeID != asdu.C_SE_NA_1 && typeID != asdu.C_SE_TA_1 {
 		return asdu.ErrTypeIDNotMatch
 	}
-	u := newCommandASDU(conn, typeID, asdu.ActivationCon, ca)
+	u := newCommandASDU(conn, typeID, cause, ca)
 	if err := u.AppendInfoObjAddr(cmd.Ioa); err != nil {
 		return err
 	}
@@ -167,11 +101,11 @@ func confirmSetpointNormal(conn asdu.Connect, typeID asdu.TypeID, ca asdu.Common
 
 // confirmSetpointScaled echoes a scaled set-point command as an activation
 // confirmation.
-func confirmSetpointScaled(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr, cmd asdu.SetpointCommandScaledInfo) error {
+func confirmSetpointScaled(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca asdu.CommonAddr, cmd asdu.SetpointCommandScaledInfo) error {
 	if typeID != asdu.C_SE_NB_1 && typeID != asdu.C_SE_TB_1 {
 		return asdu.ErrTypeIDNotMatch
 	}
-	u := newCommandASDU(conn, typeID, asdu.ActivationCon, ca)
+	u := newCommandASDU(conn, typeID, cause, ca)
 	if err := u.AppendInfoObjAddr(cmd.Ioa); err != nil {
 		return err
 	}
@@ -189,11 +123,11 @@ func confirmSetpointScaled(conn asdu.Connect, typeID asdu.TypeID, ca asdu.Common
 // only COT Activation(6)/Deactivation(8) and therefore cannot emit the
 // ActivationCon(7) confirmation, and mirroring is unsafe after
 // pack.GetBitsString32Cmd() has consumed the received ASDU.
-func confirmBitsString32Cmd(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr, cmd asdu.BitsString32CommandInfo) error {
+func confirmBitsString32Cmd(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca asdu.CommonAddr, cmd asdu.BitsString32CommandInfo) error {
 	if typeID != asdu.C_BO_NA_1 && typeID != asdu.C_BO_TA_1 {
 		return asdu.ErrTypeIDNotMatch
 	}
-	u := newCommandASDU(conn, typeID, asdu.ActivationCon, ca)
+	u := newCommandASDU(conn, typeID, cause, ca)
 	if err := u.AppendInfoObjAddr(cmd.Ioa); err != nil {
 		return err
 	}
@@ -206,11 +140,11 @@ func confirmBitsString32Cmd(conn asdu.Connect, typeID asdu.TypeID, ca asdu.Commo
 
 // confirmSetpointFloat echoes a short-float set-point command as an activation
 // confirmation.
-func confirmSetpointFloat(conn asdu.Connect, typeID asdu.TypeID, ca asdu.CommonAddr, cmd asdu.SetpointCommandFloatInfo) error {
+func confirmSetpointFloat(conn asdu.Connect, typeID asdu.TypeID, cause asdu.Cause, ca asdu.CommonAddr, cmd asdu.SetpointCommandFloatInfo) error {
 	if typeID != asdu.C_SE_NC_1 && typeID != asdu.C_SE_TC_1 {
 		return asdu.ErrTypeIDNotMatch
 	}
-	u := newCommandASDU(conn, typeID, asdu.ActivationCon, ca)
+	u := newCommandASDU(conn, typeID, cause, ca)
 	if err := u.AppendInfoObjAddr(cmd.Ioa); err != nil {
 		return err
 	}
@@ -233,19 +167,5 @@ func sendCounterRequest(conn asdu.Connect, cause asdu.Cause, ca asdu.CommonAddr,
 		return err
 	}
 	u.AppendBinaryCounterReading(value)
-	return conn.Send(u)
-}
-
-// confirmReadError answers a read command for an address that is not part of the
-// process image with a C_RD_NA_1 carrying the given cause (asdu.UnknownIOA = 47).
-//
-// Built fresh because pack.GetReadCmd() has already consumed the request, and
-// because the read dispatch must keep the transmitted IOA (unlike the
-// InfoObjAddrIrrelevant used by the station-level confirmations above).
-func confirmReadError(conn asdu.Connect, ca asdu.CommonAddr, cause asdu.Cause, ioa asdu.InfoObjAddr) error {
-	u := newCommandASDU(conn, asdu.C_RD_NA_1, cause, ca)
-	if err := u.AppendInfoObjAddr(ioa); err != nil {
-		return err
-	}
 	return conn.Send(u)
 }

@@ -61,5 +61,5 @@ systemctl --no-pager --full status iec104-server.service || true
 
 echo
 echo "done. follow outstation logs with: journalctl -u iec104-server -f"
-echo "listening on 0.0.0.0:2404; the MSL5 backend's master client connects to it"
+echo "dialling MSL5 at 127.0.0.1:2404 (edit /etc/systemd/system/iec104-server.service to change -msl5-host/-msl5-port/-ca)"
 

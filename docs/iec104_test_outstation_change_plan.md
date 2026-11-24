@@ -1,3 +1,5 @@
+> **Superseded:** VK is now an IEC 104 client that dials MSL5; see [architecture.md](architecture.md). This document describes the former server role.
+
 # IEC 60870-5-104 – Test Outstation – Required Changes
 
 **Status: implemented (2026-11-18).** See §11 "Implementation status" for what was

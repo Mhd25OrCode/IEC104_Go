@@ -1,3 +1,5 @@
+> **Superseded:** VK is now an IEC 104 client that dials MSL5; see [architecture.md](architecture.md). This document describes the former server role.
+
 # IEC 60870-5-104 – Section „104-IN“ – Backend + Frontend Implementation Plan
 
 **Status: planning only – no code was modified while writing this document.**
