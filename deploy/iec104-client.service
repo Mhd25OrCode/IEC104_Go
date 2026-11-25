@@ -9,7 +9,7 @@ Type=simple
 User=iec104
 Group=iec104
 WorkingDirectory=/opt/iec104
-ExecStart=/opt/iec104/iec104-client -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1
+ExecStart=/opt/iec104/iec104-client -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1 -log-frames
 Restart=always
 RestartSec=2
 

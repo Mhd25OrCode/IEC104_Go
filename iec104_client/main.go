@@ -24,7 +24,8 @@ func main() {
 	cmdOnChange := flag.Bool("cmd-on-change", true, "send commands immediately (debounced) when a command value changes")
 	reconnect := flag.Duration("reconnect", 2*time.Second, "delay between reconnect attempts")
 	duration := flag.Duration("duration", 0, "run for this long, then exit (0 = until Ctrl+C)")
-	verbose := flag.Bool("verbose", false, "enable wendy512/go-iecp5 library logging (frames + decode errors)")
+	logFrames := flag.Bool("log-frames", false, "log every ASDU sent to / received from MSL5 (TX/RX lines)")
+	verbose := flag.Bool("verbose", false, "enable -log-frames plus the wendy512/go-iecp5 library log (raw frames + decode errors)")
 	flag.Parse()
 
 	if *ca == 0 || *ca > 0xFFFF {
@@ -32,7 +33,8 @@ func main() {
 	}
 
 	addr := net.JoinHostPort(*msl5Host, strconv.Itoa(*msl5Port))
-	cli, snd, _, err := newClient(addr, asdu.CommonAddr(*ca), *cmdInterval, *cmdOnChange, *reconnect, *verbose)
+	lg := logConfig{frames: *logFrames || *verbose, lib: *verbose}
+	cli, snd, _, err := newClient(addr, asdu.CommonAddr(*ca), *cmdInterval, *cmdOnChange, *reconnect, lg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -62,22 +64,30 @@ func main() {
 	log.Println("client stopped")
 }
 
+// logConfig selects what the client prints. frames logs one TX/RX line per
+// ASDU sent or received; lib additionally enables the go-iecp5 internal log
+// (raw APDUs, frame bookkeeping and ASDU decode errors).
+type logConfig struct {
+	frames bool
+	lib    bool
+}
+
 // newClient wires the cs104 client, the monitoring image and the command
 // sender. Start the returned client with Start(); it reconnects in the
 // background.
-func newClient(addr string, ca asdu.CommonAddr, interval time.Duration, onChange bool, reconnect time.Duration, verbose bool) (*cs104.Client, *sender, *station, error) {
+func newClient(addr string, ca asdu.CommonAddr, interval time.Duration, onChange bool, reconnect time.Duration, lg logConfig) (*cs104.Client, *sender, *station, error) {
 	opt := cs104.NewOption()
 	opt.SetReconnectInterval(reconnect)
 	if err := opt.AddRemoteServer(addr); err != nil {
 		return nil, nil, nil, err
 	}
 
-	st := newStation(verbose)
-	cli := cs104.NewClient(&clientHandler{st: st, verbose: verbose}, opt)
+	st := newStation(lg.frames)
+	cli := cs104.NewClient(&clientHandler{st: st, logFrames: lg.frames}, opt)
 	// Library logs are off by default and swallow ASDU decode errors.
-	cli.LogMode(verbose)
+	cli.LogMode(lg.lib)
 
-	snd := newSender(cli, ca, defaultCommandPoints(), interval, onChange, verbose)
+	snd := newSender(cli, ca, defaultCommandPoints(), interval, onChange, lg.frames)
 
 	// MSL5 never sends STARTDT; the client must. Sends are only possible once
 	// STARTDT is confirmed, so the sender starts in the active handler.
@@ -95,4 +105,3 @@ func newClient(addr string, ca asdu.CommonAddr, interval time.Duration, onChange
 	})
 	return cli, snd, st, nil
 }
-

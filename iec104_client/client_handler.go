@@ -8,17 +8,17 @@ import (
 
 // clientHandler adapts the station to cs104.ClientHandlerInterface. ASDUHandler
 // receives MSL5's monitoring frames and confirmations; every request type is
-// out of scope and is logged (verbose) and never answered.
+// out of scope and is logged (with -log-frames) and never answered.
 type clientHandler struct {
-	st      *station
-	verbose bool
+	st        *station
+	logFrames bool
 }
 
 func (h *clientHandler) ASDUHandler(c asdu.Connect, p *asdu.ASDU) error { return h.st.OnASDU(c, p) }
 
 func (h *clientHandler) ignore(what string, p *asdu.ASDU) error {
-	if h.verbose {
-		fmt.Printf("[client] ignoring %s: type=%v COT=%v CA=%d\n", what, p.Type, p.Identifier.Coa, p.CommonAddr)
+	if h.logFrames {
+		fmt.Printf("[client] RX ignoring %s: type=%v %v CA=%d\n", what, p.Type, p.Identifier.Coa, p.CommonAddr)
 	}
 	return nil
 }

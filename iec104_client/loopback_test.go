@@ -112,7 +112,7 @@ func TestLoopbackAgainstRealServer(t *testing.T) {
 	srv := startMSL5LikeServer(t, addr, h)
 
 	const interval = 300 * time.Millisecond
-	cli, snd, st, err := newClient(addr, 1, interval, false, 100*time.Millisecond, false)
+	cli, snd, st, err := newClient(addr, 1, interval, false, 100*time.Millisecond, logConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestNoCommandLoop(t *testing.T) {
 	srv := startMSL5LikeServer(t, addr, h)
 	defer srv.Close()
 
-	cli, snd, _, err := newClient(addr, 1, time.Hour, false, 100*time.Millisecond, false)
+	cli, snd, _, err := newClient(addr, 1, time.Hour, false, 100*time.Millisecond, logConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

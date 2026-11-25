@@ -67,11 +67,11 @@ func defaultCommandPoints() []commandPoint {
 // sender sends the configured commands to MSL5 (COT Activation) while the
 // session is active.
 type sender struct {
-	conn     asdu.Connect
-	ca       asdu.CommonAddr
-	interval time.Duration
-	onChange bool
-	verbose  bool
+	conn      asdu.Connect
+	ca        asdu.CommonAddr
+	interval  time.Duration
+	onChange  bool
+	logFrames bool
 
 	mu     sync.Mutex // guards points, stop, done
 	points []commandPoint
@@ -80,15 +80,15 @@ type sender struct {
 	kick   chan struct{}
 }
 
-func newSender(conn asdu.Connect, ca asdu.CommonAddr, points []commandPoint, interval time.Duration, onChange, verbose bool) *sender {
+func newSender(conn asdu.Connect, ca asdu.CommonAddr, points []commandPoint, interval time.Duration, onChange, logFrames bool) *sender {
 	return &sender{
-		conn:     conn,
-		ca:       ca,
-		points:   append([]commandPoint(nil), points...),
-		interval: interval,
-		onChange: onChange,
-		verbose:  verbose,
-		kick:     make(chan struct{}, 1),
+		conn:      conn,
+		ca:        ca,
+		points:    append([]commandPoint(nil), points...),
+		interval:  interval,
+		onChange:  onChange,
+		logFrames: logFrames,
+		kick:      make(chan struct{}, 1),
 	}
 }
 
@@ -183,6 +183,7 @@ func (s *sender) sendAll() {
 	points := append([]commandPoint(nil), s.points...)
 	s.mu.Unlock()
 
+	act := coa(asdu.Activation)
 	for _, p := range points {
 		if err := s.send(p); err != nil {
 			if errors.Is(err, asdu.ErrTypeIDNotMatch) {
@@ -192,12 +193,12 @@ func (s *sender) sendAll() {
 			logSendError(p.Type.String(), err)
 			return
 		}
-		s.logf("sent %v IOA=%d value=%v CA=%d\n", p.Type, p.IOA, p.Value, s.ca)
+		s.logf("TX %v %v CA=%d IOA=%d value=%v\n", p.Type, act, s.ca, p.IOA, p.Value)
 	}
 }
 
 func (s *sender) logf(format string, args ...any) {
-	if s.verbose {
+	if s.logFrames {
 		fmt.Printf("[client] "+format, args...)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -238,24 +239,39 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(out)
 }
 
-func TestVerboseGating(t *testing.T) {
-	run := func(verbose bool) string {
+func TestFrameLogGating(t *testing.T) {
+	run := func(logFrames bool) (rx, tx string) {
 		// Getters consume a frame, so decode fresh ones for every run.
 		unhandled := request(t, func(c asdu.Connect) error {
 			return asdu.MeasuredValueNormal(c, false, coa(asdu.Spontaneous), 1, asdu.MeasuredValueNormalInfo{Ioa: 1})
 		})
 		monitored := request(t, monitoringFrames(1)[0])
-		st := newStation(verbose)
-		return captureStdout(t, func() {
+		st := newStation(logFrames)
+		rx = captureStdout(t, func() {
 			_ = st.OnASDU(newCaptureConn(t), unhandled)
 			_ = st.OnASDU(newCaptureConn(t), monitored)
 		})
+
+		conn := newCaptureConn(t)
+		snd := newSender(conn, 3, defaultCommandPoints(), 0, false, logFrames)
+		snd.Set(100, true)
+		tx = captureStdout(t, snd.sendAll)
+		return rx, tx
 	}
-	if out := run(false); out != "" {
-		t.Errorf("default verbosity printed %q", out)
+	if rx, tx := run(false); rx != "" || tx != "" {
+		t.Errorf("default verbosity printed rx=%q tx=%q", rx, tx)
 	}
-	if out := run(true); out == "" {
-		t.Error("verbose printed nothing")
+
+	rx, tx := run(true)
+	for _, want := range []string{"RX unhandled ASDU", "RX TID<M_SP_NA_1> COT", "IOA=100"} {
+		if !strings.Contains(rx, want) {
+			t.Errorf("RX log missing %q: %q", want, rx)
+		}
+	}
+	for _, want := range []string{"TX TID<C_SC_NA_1> COT<Activation>", "CA=3", "IOA=100 value=true"} {
+		if !strings.Contains(tx, want) {
+			t.Errorf("TX log missing %q: %q", want, tx)
+		}
 	}
 }
 

@@ -36,19 +36,19 @@ type station struct {
 	mu            sync.Mutex
 	monitoring    map[pointKey]monitoringValue
 	confirmations map[pointKey]confirmation
-	verbose       bool
+	logFrames     bool
 }
 
-func newStation(verbose bool) *station {
+func newStation(logFrames bool) *station {
 	return &station{
 		monitoring:    make(map[pointKey]monitoringValue),
 		confirmations: make(map[pointKey]confirmation),
-		verbose:       verbose,
+		logFrames:     logFrames,
 	}
 }
 
 func (st *station) logf(format string, args ...any) {
-	if st.verbose {
+	if st.logFrames {
 		fmt.Printf("[client] "+format, args...)
 	}
 }
@@ -74,10 +74,11 @@ func (st *station) Confirmation(k pointKey) (confirmation, bool) {
 
 // OnASDU handles frames routed through ASDUHandler. Monitoring frames update
 // the image; COT 7/10 are recorded as confirmations; everything else is only
-// logged (verbose). It never sends and never returns an error: a handler error
-// would make the library mirror the frame back.
+// logged (with -log-frames). It never sends and never returns an error: a
+// handler error would make the library mirror the frame back.
 func (st *station) OnASDU(_ asdu.Connect, pack *asdu.ASDU) error {
 	ca := pack.CommonAddr
+	cot := pack.Identifier.Coa
 
 	if isCommandType(pack.Type) {
 		st.recordCommandFrame(pack)
@@ -87,40 +88,44 @@ func (st *station) OnASDU(_ asdu.Connect, pack *asdu.ASDU) error {
 	switch pack.Type {
 	case asdu.M_SP_NA_1:
 		for _, o := range pack.GetSinglePoint() {
-			st.put(ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value, Qds: o.Qds, Time: o.Time})
+			st.put(cot, ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value, Qds: o.Qds, Time: o.Time})
 		}
 		return nil
 	case asdu.M_DP_NA_1:
 		for _, o := range pack.GetDoublePoint() {
-			st.put(ca, o.Ioa, monitoringValue{Type: pack.Type, Value: uint8(o.Value), Qds: o.Qds, Time: o.Time})
+			st.put(cot, ca, o.Ioa, monitoringValue{Type: pack.Type, Value: uint8(o.Value), Qds: o.Qds, Time: o.Time})
 		}
 		return nil
 	case asdu.M_ME_NC_1, asdu.M_ME_TF_1:
 		for _, o := range pack.GetMeasuredValueFloat() {
-			st.put(ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value, Qds: o.Qds, Time: o.Time})
+			st.put(cot, ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value, Qds: o.Qds, Time: o.Time})
 		}
 		return nil
 	case asdu.M_ME_NB_1:
 		for _, o := range pack.GetMeasuredValueScaled() {
-			st.put(ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value, Qds: o.Qds, Time: o.Time})
+			st.put(cot, ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value, Qds: o.Qds, Time: o.Time})
 		}
 		return nil
 	case asdu.M_IT_NA_1:
 		for _, o := range pack.GetIntegratedTotals() {
-			st.put(ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value.CounterReading, Time: o.Time})
+			st.put(cot, ca, o.Ioa, monitoringValue{Type: pack.Type, Value: o.Value.CounterReading, Time: o.Time})
 		}
 		return nil
 	}
-	st.logf("unhandled ASDU: type=%v COT=%v CA=%d\n", pack.Type, pack.Identifier.Coa, ca)
+	st.logf("RX unhandled ASDU: %v %v CA=%d\n", pack.Type, cot, ca)
 	return nil
 }
 
-func (st *station) put(ca asdu.CommonAddr, ioa asdu.InfoObjAddr, v monitoringValue) {
+func (st *station) put(cot asdu.CauseOfTransmission, ca asdu.CommonAddr, ioa asdu.InfoObjAddr, v monitoringValue) {
 	v.At = time.Now()
 	st.mu.Lock()
 	st.monitoring[pointKey{ca, ioa}] = v
 	st.mu.Unlock()
-	st.logf("monitoring: %v CA=%d IOA=%d value=%v qds=0x%02X\n", v.Type, ca, ioa, v.Value, byte(v.Qds))
+	if v.Time.IsZero() {
+		st.logf("RX %v %v CA=%d IOA=%d value=%v qds=0x%02X\n", v.Type, cot, ca, ioa, v.Value, byte(v.Qds))
+		return
+	}
+	st.logf("RX %v %v CA=%d IOA=%d value=%v qds=0x%02X time=%s\n", v.Type, cot, ca, ioa, v.Value, byte(v.Qds), v.Time.Format(time.RFC3339Nano))
 }
 
 func isCommandType(t asdu.TypeID) bool {
@@ -139,14 +144,14 @@ func (st *station) recordCommandFrame(pack *asdu.ASDU) {
 	ca := pack.CommonAddr
 	cause := pack.Identifier.Coa.Cause
 	if cause != asdu.ActivationCon && cause != asdu.ActivationTerm {
-		st.logf("ignoring command frame: type=%v COT=%v CA=%d\n", pack.Type, pack.Identifier.Coa, ca)
+		st.logf("RX ignored command frame: %v %v CA=%d\n", pack.Type, pack.Identifier.Coa, ca)
 		return
 	}
 	ioa := commandFrameIOA(pack)
 	st.mu.Lock()
 	st.confirmations[pointKey{ca, ioa}] = confirmation{Cause: cause, At: time.Now()}
 	st.mu.Unlock()
-	st.logf("confirmation: %v COT=%v CA=%d IOA=%d\n", pack.Type, pack.Identifier.Coa, ca, ioa)
+	st.logf("RX confirmation: %v %v CA=%d IOA=%d\n", pack.Type, pack.Identifier.Coa, ca, ioa)
 }
 
 func commandFrameIOA(p *asdu.ASDU) asdu.InfoObjAddr {

@@ -363,12 +363,13 @@ self-sustaining loop (and duplicate writes on MSL5).
 | `handler.go` command cases | `fmt.Printf("[client] single command: …")` etc. **always** | `-verbose` only |
 | `handler.go` `changed()` | `fmt.Printf("[client] applied: …")` **always** | `-verbose` only |
 | `client_handler.go` `ignore()` | already `-verbose`-gated | keep |
+| `main.go` flags | only `-verbose` (per-frame lines + library log) | add `-log-frames` for the app-level `TX`/`RX` lines only; keep `-verbose` = `-log-frames` + library log |
 | `reporter.go` `logSendError()` | unconditional (file is removed) | move the equivalent into the sender, keep the error-class filtering |
-| incoming `M_*` application | new | `-verbose` only |
+| incoming `M_*` application | new | `-log-frames` only |
 
 ### 7.2 Default output
 
-At default verbosity the unit log must contain **only** lifecycle events:
+With no flags the unit log contains **only** lifecycle events:
 
 ```text
 [client] connected to 127.0.0.1:2404, sending STARTDT
@@ -377,14 +378,19 @@ At default verbosity the unit log must contain **only** lifecycle events:
 [client] command send failed: …        (unexpected errors only)
 ```
 
-No per-frame lines. On a Pi this matters: journald rate-limits and the current 6 lines / 5 s flood
-hides real errors.
+No per-frame lines. The shipped unit passes `-log-frames`, so journald also gets
+one `TX`/`RX` line per ASDU (at the default `-cmd-interval` that is ~7 sent
+commands plus ~7 received `ActCon` lines per 5 s; drop the flag or use
+`-cmd-interval 0` if that is too noisy on the Pi). `-verbose` additionally turns
+on the library's raw APDU log.
 
 ### 7.3 Acceptance
 
-- `journalctl -u iec104-client` over 10 minutes at default verbosity contains no `unhandled ASDU`, no
-  `TID<…>`, no `COT<…>` lines.
-- `iec104-client -verbose` shows incoming `M_*`, outgoing `C_*`, confirmations and ignored types.
+- With `-log-frames` removed, `journalctl -u iec104-client` over 10 minutes
+  contains no per-frame lines (`TID<…>`, `COT<…>`, `unhandled ASDU`).
+- `iec104-client -log-frames` shows incoming `M_*` (`RX … value=… qds=…`),
+  outgoing `C_*` (`TX … COT<Activation>`), confirmations and ignored types.
+- `iec104-client -verbose` implies `-log-frames` and adds the raw APDU dump.
 
 ---
 
@@ -431,10 +437,10 @@ Reference implementation on the MSL5 side: `src/packages/iec104/server_test.go`
 | 6 | `TestSendOnChange` | change a value, debounce 100 ms | exactly one additional frame, value updated |
 | 7 | `TestConfirmationIsNotExecuted` | feed `C_SC_NA_1` with COT 7 and COT 10 | image unchanged, 0 frames sent, confirmation recorded |
 | 8 | `TestNoCommandLoop` | integration: client sends 1 command, server mirrors ActCon | over 3 intervals the server receives exactly 1 command |
-| 9 | `TestRejectedTypeGetsNoReply` | server sends an unsupported type | client sends nothing, logs only at verbose |
+| 9 | `TestRejectedTypeGetsNoReply` | server sends an unsupported type | client sends nothing, logs only at frame level |
 | 10 | `TestSenderIdempotent` | `Start`/`Stop` repeatedly, `-race` | no panic, no goroutine leak |
 | 11 | `TestSendErrorsAreNotFatal` | `captureConn` returning `ErrNotActive` / `ErrBufferFulled` | no panic, no busy loop |
-| 12 | `TestVerboseGating` | `OnASDU` with an unhandled type, default verbosity | no output on stdout |
+| 12 | `TestFrameLogGating` | an unhandled `OnASDU` type and one sent command, first at default verbosity, then with `-log-frames` | no output by default; `RX`/`TX` lines with the flag |
 | 13 | `TestReconnectResumesSending` | kill server, restart | commands resume after new STARTDT without restarting the client |
 
 ### 8.4 Quality gate
@@ -448,7 +454,7 @@ go build ./... && go vet ./... && go test -race ./... && test -z "$(gofmt -l .)"
 1. MSL5: `PUT /api/iec104/server` with `{"enabled":true,"ipAddress":"0.0.0.0","port":2404}`.
 2. MSL5: create at least one **IN** row (MSL5 → `M_*`) and one **OUT** row (VK → `C_*`) with matching
    CA/IOA/type and a linked channel.
-3. Run `./iec104-client -msl5-host <ip> -msl5-port 2404 -ca 1 -cmd-interval 5s -verbose`.
+3. Run `./iec104-client -msl5-host <ip> -msl5-port 2404 -ca 1 -cmd-interval 5s -log-frames`.
 4. Expected:
    - `GET /api/iec104/server` → `active`;
    - client log shows the incoming `M_*` values of the MSL5 IN row;
@@ -492,7 +498,7 @@ Functional:
 - [ ] COT 7 / COT 10 are recognised as confirmations, never executed, never answered.
 - [ ] No command loop: one command produces exactly one outgoing frame.
 - [ ] No `SendReplyMirror` on any outgoing path; all ASDUs are built fresh.
-- [ ] `unhandled ASDU` and per-frame logs are only emitted with `-verbose`.
+- [ ] `unhandled ASDU` and per-frame logs are only emitted with `-log-frames` (`-verbose` also enables them).
 - [ ] Reconnect: after MSL5 restarts, commands resume automatically after the new STARTDT.
 - [ ] One VK instance only; the unit does not start a second one.
 
@@ -507,7 +513,7 @@ Operational:
 - [ ] On the device: `journalctl -u iec104-client` shows no `COT<UnknownTypeID>` and no `unhandled ASDU`
       at default verbosity over 10 minutes.
 - [ ] MSL5 `GET /api/iec104` shows incoming OUT-row confirmations with `cot.cause: 7` and updated channel
-      values; the IN row values appear in the VK client log with `-verbose`.
+      values; the IN row values appear in the VK client log with `-log-frames`.
 
 ---
 

@@ -32,7 +32,7 @@ Design notes for [`iec104_client/`](../iec104_client) (see also the root
 Only `C_*` commands (out) and `M_*` monitoring frames (in) exist. The client never
 sends `M_*` and never answers confirmations. General interrogation,
 counter interrogation, read, clock sync, test, reset process and delay
-acquisition are out of scope: the handlers log (with `-verbose`) and return `nil`,
+acquisition are out of scope: the handlers log (with `-log-frames`) and return `nil`,
 never answering.
 
 ## 2. MSL5 contract
@@ -65,7 +65,7 @@ MSL5 is a stock IEC 104 server; this client must satisfy the following
 
 | File | Responsibility |
 | :-- | :-- |
-| `main.go` | flags (`-msl5-host`, `-msl5-port`, `-ca`, `-cmd-interval`, `-cmd-on-change`, `-reconnect`, `-duration`, `-verbose`), `newClient()` wiring, shutdown on `-duration` or SIGINT/SIGTERM |
+| `main.go` | flags (`-msl5-host`, `-msl5-port`, `-ca`, `-cmd-interval`, `-cmd-on-change`, `-reconnect`, `-duration`, `-log-frames`, `-verbose`), `newClient()` wiring, shutdown on `-duration` or SIGINT/SIGTERM |
 | `client_handler.go` | `clientHandler`: `cs104.ClientHandlerInterface` adapter; `ASDUHandler` → `station.OnASDU`, all other handlers ignore |
 | `handler.go` | `station` = monitoring image keyed by CA + IOA, recorded confirmations, `OnASDU` |
 | `confirm.go` | `coa()` and `newCommandASDU()` (fresh single-object ASDU) |
@@ -87,6 +87,11 @@ MSL5 is a stock IEC 104 server; this client must satisfy the following
    dedicated (ignoring) handlers, everything else, including all `M_*` and the
    mirrored `C_*` confirmations, goes to `ASDUHandler`. Handlers run on one
    goroutine per session and must not block.
+6. Logging: default output is lifecycle only. `-log-frames` prints one `TX` or
+   `RX` line per ASDU (sent `C_*`, received `M_*`, confirmations, ignored
+   types); `-verbose` implies it and additionally enables the go-iecp5 library
+   log via `cli.LogMode(true)` (raw APDUs, frame bookkeeping, decode errors).
+   The systemd unit passes `-log-frames`.
 
 MSL5 keeps one session (newest wins): run exactly one instance per MSL5.
 
@@ -105,7 +110,7 @@ type station struct {
 	mu            sync.Mutex
 	monitoring    map[pointKey]monitoringValue // M_* by (CA, IOA)
 	confirmations map[pointKey]confirmation    // last COT 7 / 10
-	verbose       bool
+	logFrames     bool
 }
 ```
 
@@ -134,8 +139,9 @@ stored under the CA they carry.
   builds a frame with the library helpers and decodes it again, giving
   handlers the same "consumed" ASDU they see in production.
 * Unit tests cover the monitoring image, confirmations (never executed or
-  answered), verbose gating, ignored requests, the seven command types
-  (COT 6, CA, IOA, value), send-on-change, sender lifecycle and send errors.
+  answered), frame-log gating (`-log-frames` off/on), ignored requests, the
+  seven command types (COT 6, CA, IOA, value), send-on-change, sender lifecycle
+  and send errors.
 * `loopback_test.go` runs the real `newClient` wiring against an MSL5-like
   `cs104.Server` on a free `127.0.0.1` port: STARTDT, commands mirrored as
   ActCon, monitoring image, no command loop, and resume after a server restart.

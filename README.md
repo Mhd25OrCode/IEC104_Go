@@ -12,7 +12,7 @@ roles are deliberately inverted on the application level (see
 [`VK_IEC104_MIGRATION.md`](VK_IEC104_MIGRATION.md)). The client never sends
 `M_*`, never answers confirmations (COT 7/10) and never answers general
 interrogation, counter interrogation, read, clock sync, test or reset requests;
-such frames are ignored (logged with `-verbose`).
+such frames are ignored (logged with `-log-frames`).
 
 Run exactly **one** instance per MSL5: MSL5 keeps one session ("newest wins"), so
 two instances kick each other out through auto-reconnect.
@@ -46,6 +46,9 @@ go test ./...         # unit + loopback tests (loopback binds 127.0.0.1 on a fre
 # dial MSL5 on the same machine, run until Ctrl+C (or pass -duration 60s)
 .\iec104-client.exe -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1
 
+# same, with one line per ASDU sent to / received from MSL5 (TX/RX)
+.\iec104-client.exe -msl5-host 192.168.1.10 -ca 1 -log-frames
+
 # same, with the library's frame/decode log
 .\iec104-client.exe -msl5-host 192.168.1.10 -ca 1 -verbose
 ```
@@ -59,7 +62,8 @@ go test ./...         # unit + loopback tests (loopback binds 127.0.0.1 on a fre
 | `-cmd-on-change` | `true` | send the commands immediately (debounced 100 ms) when a command value changes |
 | `-reconnect` | `2s` | delay between reconnect attempts |
 | `-duration` | `0` | run this long, then exit (`0` = until Ctrl+C / SIGTERM) |
-| `-verbose` | `false` | enable the go-iecp5 library log (frames + decode errors) |
+| `-log-frames` | `false` | log one line per ASDU sent to / received from MSL5 (`TX`/`RX`, no library internals) |
+| `-verbose` | `false` | enable `-log-frames` plus the go-iecp5 library log (raw frames, frame bookkeeping, decode errors) |
 
 The library reconnects forever, so MSL5 may start later or restart. Wire
 parameters are the library default `asdu.ParamsWide` (COT 2 bytes, CA 2 bytes,
@@ -92,15 +96,25 @@ Commands are sent only while the session is active: every `-cmd-interval`, and
 `M_SP_NA_1`, `M_DP_NA_1`, `M_ME_NC_1`, `M_ME_TF_1`, `M_ME_NB_1` and `M_IT_NA_1`
 (including `SQ=1` / several objects) are stored in the monitoring image keyed by
 the frame's CA + IOA with value, quality and time tag (`station.Snapshot()`).
-Other types are only logged with `-verbose`.
+Other types are only logged with `-log-frames`.
 
 COT 7 / COT 10 command frames are recorded as confirmations and neither executed
 nor answered, so MSL5's `ActCon` mirror can never re-arm the sender. Received
 data never triggers an outgoing frame.
 
 At default verbosity only lifecycle lines are printed (connected, STARTDT
-confirmed, connection lost, unexpected send failures); `-verbose` adds every
-received `M_*`, sent `C_*`, confirmation and ignored type.
+confirmed, connection lost, unexpected send failures). `-log-frames` adds one
+`TX`/`RX` line per ASDU — every sent `C_*`, received `M_*`, confirmation and
+ignored type — for example:
+
+```text
+[client] TX TID<C_SC_NA_1> COT<Activation> CA=1 IOA=100 value=false
+[client] RX TID<M_ME_NC_1> COT<Spontaneous> CA=1 IOA=301 value=12.5 qds=0x00
+```
+
+`-verbose` implies `-log-frames` and additionally enables the go-iecp5 library
+log (raw APDUs, frame bookkeeping, ASDU decode errors). The shipped systemd
+unit passes `-log-frames`.
 
 ## Tests
 
@@ -110,7 +124,7 @@ received `M_*`, sent `C_*`, confirmation and ignored type.
 | :-- | :-- |
 | `TestIncomingMonitoringUpdatesImage`, `...UsesFrameCA`, `...MultipleInfoObjects` | the six `M_*` types land in the image keyed by frame CA + IOA, quality/time kept, `SQ=1` |
 | `TestConfirmationIsNotExecuted`, `TestRejectedTypeGetsNoReply` | COT 7/10/6/8 command frames and unsupported types are never executed or answered |
-| `TestVerboseGating` | no output at default verbosity |
+| `TestFrameLogGating` | no TX/RX output at default verbosity; `-log-frames` prints both |
 | `TestOutOfScopeRequestsAreNotAnswered` | GI, CI, read and clock sync are not answered |
 | `TestOutgoingCommandsUseActivation`, `TestDoubleCommandValueIsClamped` | all seven types: COT 6, CA, IOA, value, one object per ASDU |
 | `TestSendOnChange`, `TestSenderIdempotent`, `TestSendErrorsAreNotFatal` | send-on-change, Start/Stop concurrency, send errors |
@@ -141,7 +155,7 @@ MSL5 never sends them. Details: [`docs/iec104_library_bug_report.md`](docs/iec10
    `{"enabled":true,"ipAddress":"0.0.0.0","port":2404}` (state `listening`).
 2. Create an IN row (MSL5 → `M_*`, e.g. `M_ME_NC_1`, CA 1, IOA 301) and an OUT
    row (VK → `C_*`, e.g. `C_SC_NA_1`, CA 1, IOA 100) with linked channels.
-3. Start `iec104-client -msl5-host <msl5-ip> -msl5-port 2404 -ca 1 -cmd-interval 5s -verbose`.
+3. Start `iec104-client -msl5-host <msl5-ip> -msl5-port 2404 -ca 1 -cmd-interval 5s -log-frames`.
 
 Expected: MSL5 reports `connected`, then `active`; the client log shows the IN
 row's `M_*` values; the OUT row's `responsePayload` shows the `C_*` frame with
@@ -258,7 +272,7 @@ outgoing connections). The library reconnects by itself; the unit is the safety 
 ### Smoke test (binary directly, no systemd)
 
 ```bash
-./dist/iec104-client -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1 -duration 20s &
+./dist/iec104-client -msl5-host 127.0.0.1 -msl5-port 2404 -ca 1 -log-frames -duration 20s &
 # MSL5 (or any IEC 104 server) must be listening on that port
 ```
 
