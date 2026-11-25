@@ -9,6 +9,12 @@ and the missing `infoObjSize` rows for Type IDs 58–64.
 > interrogation, read and clock sync on a two-program (outstation + master) test
 > system. Those features are out of scope here — this client never answers GI, CI
 > or read — so that material has been dropped. The analysis below is unchanged.
+>
+> **Migration note:** `SendReplyMirror` remains forbidden after any `Get*()` call.
+> The COT 44 (`UnknownTypeID`) mirror seen in the old logs is produced by the
+> *server* library (`cs104/server_session.go`) when MSL5's application handler
+> returns an error for an unsupported type — it is not sent by this client. See
+> [`../VK_IEC104_MIGRATION.md`](../VK_IEC104_MIGRATION.md).
 
 ## 1. Bug 1 — `SendReplyMirror()` after `Get*Cmd()` sends a truncated confirmation
 

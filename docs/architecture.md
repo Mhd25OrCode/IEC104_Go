@@ -1,4 +1,4 @@
-# IEC 60870-5-104 Client (Outstation) — Architecture
+# IEC 60870-5-104 Client — Architecture
 
 Design notes for [`iec104_client/`](../iec104_client) (see also the root
 [`README.md`](../README.md) and the library report
@@ -9,9 +9,10 @@ Design notes for [`iec104_client/`](../iec104_client) (see also the root
   `github.com/alfas/iec104-client`. `wendy512/iec104` is no longer used.
 - **Transport:** this program is the **TCP client**. It dials MSL5 (IEC 104
   server, default port 2404) and reconnects forever.
-- **Role:** *controlled station* (outstation) on the application level: it owns
-  the process image, reports it spontaneously and answers MSL5's control
-  commands.
+- **Role:** on the application level the client is the *controlling* side: it
+  sends `C_*` commands and receives MSL5's `M_*` monitoring frames (direction
+  inverted by MSL5 commit `ea8a09c1`; see
+  [`../VK_IEC104_MIGRATION.md`](../VK_IEC104_MIGRATION.md)).
 
 ---
 
@@ -19,17 +20,17 @@ Design notes for [`iec104_client/`](../iec104_client) (see also the root
 
 ```text
   VK (this repo)                                     MSL5 (IEC 104 server)
-  TCP client, controlled station                     TCP server, controlling station
+  TCP client                                         TCP server
       ── TCP connect ───────────────────────────────►
       ── STARTDT act ───────────────────────────────►
       ◄─ STARTDT con ────────────────────────────────
-      ── M_* COT 3 (spontaneous, full image) ───────►   matched by CA + IOA + type
-      ◄─ C_* COT 6 (activation, cyclic) ─────────────
-      ── C_* COT 7 (ActCon), C_* COT 10 (ActTerm) ──►   stored on the IN row
-      ── M_* COT 3 (report of the changed image) ───►
+      ── C_* COT 6 (activation, every -cmd-interval) ►   [104-OUT] stored, channel written
+      ◄─ C_* COT 7 (ActCon, mirrored by the library) ─
+      ◄─ M_* COT 3 (cyclic monitoring) ──────────────    [104-IN] stored in the image by CA + IOA
 ```
 
-Only spontaneous/cyclic data and control commands exist. General interrogation,
+Only `C_*` commands (out) and `M_*` monitoring frames (in) exist. The client never
+sends `M_*` and never answers confirmations. General interrogation,
 counter interrogation, read, clock sync, test, reset process and delay
 acquisition are out of scope: the handlers log (with `-verbose`) and return `nil`,
 never answering.
@@ -47,36 +48,29 @@ MSL5 is a stock IEC 104 server; this client must satisfy the following
   t1 15 s, t2 10 s, t3 20 s, k 12, w 8). MSL5 sends `TESTFR` after t3 of
   silence; `cs104.Client` answers it automatically.
 * **STARTDT comes from this side**, and the library drops every I-frame before
-  it. MSL5 reports `connected` on TCP accept and `active` after the first
-  received ASDU, so the first report follows the STARTDT confirmation.
-* **OUT rows (monitoring).** MSL5 accepts a frame only if its cause is
-  Spontaneous(3) or Periodic(1) *and* an active OUT row matches
-  `CA + IOA(-Ret) + type`. A match is stored in the row's `responsePayload` and
-  written to the linked SPI channel (`M_SP`/`M_DP` → digital out, measurements
-  and `M_IT_*` → analog out; double point 2/3 is stored but not written).
-  `M_ME_NA_1` cannot be configured in MSL5 v1 and is never reported.
-* **IN rows (commands).** MSL5 sends each active row's command cyclically with
-  COT 6, one information object per ASDU (SQ=0): `C_SC_NA_1`, `C_DC_NA_1`,
-  `C_SE_NA_1`, `C_SE_NB_1`, `C_SE_NC_1`, `C_BO_NA_1`. `C_SE_NA_1` carries a
-  **raw int16**, not a /32768 normalised float. Type IDs 58–64, `C_RC`, `C_IC`,
-  `C_CI`, `C_RD`, `C_CS`, `C_TS` and `C_RP` are never sent.
-* **Confirmations.** MSL5 matches a `C_*` frame to an IN row by
-  `CA + IOA + exact command type` and keeps the last one, so confirmations echo
-  the request's CA and `ActivationCon`(7) is followed by `ActivationTerm`(10).
-* **Nothing else to answer.** MSL5 never sends a negative confirmation or an
-  unknown-IOA reply; the types it ignores (`C_IC`, `C_CI`, `C_RD`, `C_CS`,
-  `C_RP`, `C_CD`) are logged here and left unanswered as well.
+  it.
+* **Commands (VK → MSL5).** MSL5 accepts only `C_SC_NA_1`, `C_DC_NA_1`,
+  `C_RC_NA_1`, `C_SE_NA_1`, `C_SE_NB_1`, `C_SE_NC_1`, `C_BO_NA_1` with COT 6, one
+  object per ASDU. Other causes are dropped silently, other types are rejected
+  and the server library mirrors them back as COT 44 (`UnknownTypeID`) — which
+  is what the old `M_*` reporter provoked. `C_SE_NA_1` carries a **raw int16**.
+  Type IDs 58–64 are never sent.
+* **Confirmations.** MSL5 mirrors every accepted command as `ActivationCon`
+  (COT 7). The client records COT 7/10 but never executes or answers them.
+* **Monitoring (MSL5 → VK).** MSL5 sends each active IN row as one object per
+  ASDU with COT 3: `M_SP_NA_1`, `M_DP_NA_1`, `M_ME_NC_1`, `M_ME_TF_1`,
+  `M_ME_NB_1`, `M_IT_NA_1`, for any CA; the client keys them by CA + IOA.
 
 ## 3. Files
 
 | File | Responsibility |
 | :-- | :-- |
-| `main.go` | flags (`-msl5-host`, `-msl5-port`, `-ca`, `-spont-interval`, `-cyclic`, `-reconnect`, `-duration`, `-verbose`), `newClient()` wiring, shutdown on `-duration` or SIGINT/SIGTERM |
+| `main.go` | flags (`-msl5-host`, `-msl5-port`, `-ca`, `-cmd-interval`, `-cmd-on-change`, `-reconnect`, `-duration`, `-verbose`), `newClient()` wiring, shutdown on `-duration` or SIGINT/SIGTERM |
 | `client_handler.go` | `clientHandler`: `cs104.ClientHandlerInterface` adapter; `ASDUHandler` → `station.OnASDU`, all other handlers ignore |
-| `handler.go` | `station` = process image, `OnASDU` command dispatch, `apply*`, ActCon + ActTerm |
-| `confirm.go` | hand-built ASDUs: `confirm*` command echoes (cause is a parameter), `sendMeasuredFloatTime`, `sendCounterRequest`, `coa()`, `newCommandASDU()` |
-| `reporter.go` | `reporter`: Start/Stop/Kick, `reportAll`, send-error handling |
-| `handler_test.go`, `loopback_test.go` | unit tests (capture connection) and a loopback test against a real `cs104.Server` |
+| `handler.go` | `station` = monitoring image keyed by CA + IOA, recorded confirmations, `OnASDU` |
+| `confirm.go` | `coa()` and `newCommandASDU()` (fresh single-object ASDU) |
+| `sender.go` | `sender`: command points, Start/Stop/Kick/Set, `sendAll`, send-error handling |
+| `handler_test.go`, `loopback_test.go` | unit tests (capture connection) and loopback tests against an MSL5-like `cs104.Server` |
 
 ## 4. Session lifecycle
 
@@ -84,77 +78,69 @@ MSL5 is a stock IEC 104 server; this client must satisfy the following
    or loss reconnects every `-reconnect` (plus ~0.5–1 s).
 2. `SetOnConnectHandler` → `SendStartDt()`. MSL5 never sends STARTDT, and the
    library drops I-frames before it.
-3. `SetServerActiveHandler` fires when STARTDT is confirmed → `reporter.Start()`.
+3. `SetServerActiveHandler` fires when STARTDT is confirmed → `sender.Start()`.
    `Send` returns `ErrNotActive` before that, so nothing is sent earlier.
-4. `SetConnectionLostHandler` → `reporter.Stop()`. Both callbacks can fire many
+4. `SetConnectionLostHandler` → `sender.Stop()`. Both callbacks can fire many
    times; `Start`/`Stop` are idempotent and goroutine-safe (`Stop` waits for the
    loop to exit).
 5. Routing of received frames: `C_IC/C_CI/C_RD/C_CS/C_TS/C_RP/C_CD` go to the
-   dedicated (ignoring) handlers, everything else, including all
-   `C_SC/C_DC/C_SE/C_BO`, goes to `ASDUHandler`. Handlers run on one goroutine
-   per session and must not block.
+   dedicated (ignoring) handlers, everything else, including all `M_*` and the
+   mirrored `C_*` confirmations, goes to `ASDUHandler`. Handlers run on one
+   goroutine per session and must not block.
 
 MSL5 keeps one session (newest wins): run exactly one instance per MSL5.
 
-## 5. Why every answer is a brand-new ASDU
+## 5. Why every outgoing frame is a brand-new ASDU
 
 The `Get*Cmd()` getters consume the ASDU's information-object buffer, so
-`SendReplyMirror()` after parsing would send a truncated body. Therefore:
+`SendReplyMirror()` after parsing would send a truncated body. The client
+therefore never mirrors: commands are built with the library builders (COT 6) or
+`newCommandASDU`, and the handler never returns an error for received frames
+(the server-side library would otherwise mirror them back as COT 44).
 
-1. parse with `pack.Get*Cmd()` only to read parameters;
-2. store the effect in the process image;
-3. build a fresh ASDU (`newCommandASDU` + `AppendInfoObjAddr` + `Append*`) with
-   the requested cause and the **request's** CA, and `conn.Send` it — first
-   `ActivationCon`, then `ActivationTerm`;
-4. never return a send error to the library: `replyOrLog` logs it and the handler
-   returns `nil`.
-
-Hand-building is also required where library helpers restrict the cause
-(`BitsString32Cmd`, `MeasuredValueFloatCP56Time2a`, `IntegratedTotals`).
-
-## 6. Process image, reporter and concurrency
+## 6. Monitoring image, sender and concurrency
 
 ```go
 type station struct {
-	mu       sync.Mutex
-	spVal    bool             // IOA 100
-	dpVal    asdu.DoublePoint // IOA 200
-	ana      float32          // IOA 301 / 302 / 303
-	counter  int32            // IOA 400
-	bits     uint32           // last C_BO_* command (not reported)
-	onChange func()           // reporter.Kick, called outside mu
+	mu            sync.Mutex
+	monitoring    map[pointKey]monitoringValue // M_* by (CA, IOA)
+	confirmations map[pointKey]confirmation    // last COT 7 / 10
+	verbose       bool
 }
 ```
 
-* `st.mu` protects the image and is **never held during `Send`**: `reportAll`
-  snapshots the image, releases the lock, then sends.
-* The reporter loop runs while the session is active: full image on start, on
-  every `-spont-interval` tick (the counter is incremented first), and after a
-  command via `Kick` with a 100 ms debounce. `Kick` is a non-blocking write to a
-  1-buffered channel.
-* Frames (COT 3, CA `-ca`, one object per ASDU): `M_SP_NA_1` 100, `M_DP_NA_1` 200
-  (0/1 only), `M_ME_NC_1` 301, `M_ME_TF_1` 302, `M_ME_NB_1` 303 (clamped int16),
-  `M_IT_NA_1` 400. `M_ME_NA_1` is never reported. With `-cyclic` only
-  `M_ME_NC_1`/`M_ME_NB_1` use COT 1 (the other helpers reject it).
-* A failed send aborts the report round: `ErrNotActive`/`ErrUseClosedConnection`
-  silently, `ErrBufferFulled` with a warning.
+* `OnASDU` decodes the six `M_*` types with the `Get*` helpers (slices, `SQ`-aware)
+  and keys them by the frame's CA. Received data never triggers a send, so MSL5's
+  `ActCon` mirror cannot loop.
+* `sender` holds the command points (`defaultCommandPoints()`: IOA 100 `C_SC`,
+  200 `C_DC`, 250 `C_RC`, 301 `C_SE_NA`, 303 `C_SE_NB`, 302 `C_SE_NC`, 400 `C_BO`).
+  Its mutex guards the points and is **never held during `Send`**: `sendAll`
+  snapshots the points, releases the lock, then sends.
+* The loop runs while the session is active: a round on start and every
+  `-cmd-interval` (none when the interval is 0), and after `Set()` via `Kick` with a
+  100 ms debounce when `-cmd-on-change` is set. `Kick` is a non-blocking write to
+  a 1-buffered channel.
+* A failed send aborts the round: `ErrNotActive`/`ErrUseClosedConnection`
+  silently, `ErrBufferFulled` with a rate-limited warning.
 
 ## 7. Common address policy
 
-Spontaneous frames use `-ca` (one CA for all of them). Command confirmations echo
-`pack.CommonAddr`, because MSL5 matches IN rows by CA + IOA + command type.
+Outgoing commands use `-ca`. Incoming `M_*` frames are accepted for any CA and
+stored under the CA they carry.
 
 ## 8. Testing approach
 
 * `captureConn` implements `asdu.Connect` and records marshalled frames; `request()`
-  builds a frame with the library's `asdu.*Cmd` helpers and decodes it again, giving
+  builds a frame with the library helpers and decodes it again, giving
   handlers the same "consumed" ASDU they see in production.
-* Unit tests cover commands (exactly ActCon then ActTerm, request CA, image
-  update, report kick), ignored requests, the six reported frames, image values,
-  `-cyclic`, reporter lifecycle under `-race`, and send errors.
-* `loopback_test.go` runs the real `newClient` wiring against a `cs104.Server` on
-  a free `127.0.0.1` port: STARTDT, spontaneous image, command → ActCon/ActTerm →
-  changed report, and reconnect to a restarted server.
+* Unit tests cover the monitoring image, confirmations (never executed or
+  answered), verbose gating, ignored requests, the seven command types
+  (COT 6, CA, IOA, value), send-on-change, sender lifecycle and send errors.
+* `loopback_test.go` runs the real `newClient` wiring against an MSL5-like
+  `cs104.Server` on a free `127.0.0.1` port: STARTDT, commands mirrored as
+  ActCon, monitoring image, no command loop, and resume after a server restart.
+  The race detector needs cgo (`go test -race`), which is not available on every
+  development machine.
 
 ## 9. Packaging and deployment
 
@@ -172,12 +158,11 @@ port 2404.
 ## 10. Library limitations
 
 `asdu.infoObjSize` lacks Type IDs 58–64 (`C_*_TA/TB/TC`): the library drops such
-frames before any handler runs. MSL5 never sends them; the tagged branches stay in
-`OnASDU` for a patched library. See
+frames before any handler runs. MSL5 never sends them and the client never sends
+them either. See
 [`iec104_library_bug_report.md`](iec104_library_bug_report.md).
 
 ## 11. Open items
 
-* `C_RC_*` (step commands) are logged as unhandled, not confirmed.
-* The image is static apart from commands and the `M_IT` counter; wiring it to
-  real I/O is out of scope.
+* Command values are static defaults (`defaultCommandPoints()`) apart from
+  `sender.Set()`; wiring them to real local inputs is out of scope.

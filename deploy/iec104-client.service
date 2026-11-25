@@ -1,5 +1,5 @@
 [Unit]
-Description=IEC 60870-5-104 client (outstation), dials MSL5
+Description=IEC 60870-5-104 client, dials MSL5
 Documentation=https://github.com/Mhd25OrCode/IEC104_Go
 After=network-online.target
 Wants=network-online.target

@@ -6,9 +6,9 @@ import (
 	"github.com/wendy512/go-iecp5/asdu"
 )
 
-// clientHandler adapts the station to cs104.ClientHandlerInterface. Only
-// control commands (ASDUHandler) are served; everything else is out of scope
-// and is logged and never answered.
+// clientHandler adapts the station to cs104.ClientHandlerInterface. ASDUHandler
+// receives MSL5's monitoring frames and confirmations; every request type is
+// out of scope and is logged (verbose) and never answered.
 type clientHandler struct {
 	st      *station
 	verbose bool

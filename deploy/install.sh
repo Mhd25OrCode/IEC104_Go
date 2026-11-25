@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install.sh - deploy the built IEC 104 client (outstation) + systemd unit on
+# install.sh - deploy the built IEC 104 client + systemd unit on
 # the Raspberry Pi CM4/CM5 (Debian arm64). Run as root, after ./build.sh.
 #
 #   ./build.sh

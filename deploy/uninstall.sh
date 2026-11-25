@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# uninstall.sh - stop/disable and remove the IEC 104 client (outstation)
+# uninstall.sh - stop/disable and remove the IEC 104 client
 # service + binary. Run as root:
 #
 #   sudo ./deploy/uninstall.sh

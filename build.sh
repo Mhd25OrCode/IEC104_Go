@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build.sh - build the IEC 60870-5-104 client (outstation) for the Raspberry Pi
+# build.sh - build the IEC 60870-5-104 client for the Raspberry Pi
 # CM4/CM5 (64-bit arm64: Debian GNU/Linux 13 "trixie" or Raspberry Pi OS
 # 64-bit).
 #
