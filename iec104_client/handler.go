@@ -72,6 +72,44 @@ func (st *station) Confirmation(k pointKey) (confirmation, bool) {
 	return c, ok
 }
 
+// CommandValue returns the outgoing value of a command point of type t from the
+// last monitoring frame received for the same CA + IOA. Only a monitoring type
+// that maps onto the command type is reported, so e.g. an M_ME_NC_1 at IOA 301
+// never feeds a C_SE_NA_1 and an M_IT_NA_1 counter never feeds a C_BO_NA_1 bit
+// string. The image is only read: a received frame still never triggers an
+// outgoing frame, the value is used by the next send round.
+func (st *station) CommandValue(ca asdu.CommonAddr, ioa asdu.InfoObjAddr, t asdu.TypeID) (any, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	v, ok := st.monitoring[pointKey{ca, ioa}]
+	if !ok {
+		return nil, false
+	}
+	switch t {
+	case asdu.C_SC_NA_1:
+		if v.Type == asdu.M_SP_NA_1 {
+			b, ok := v.Value.(bool)
+			return b, ok
+		}
+	case asdu.C_DC_NA_1:
+		if v.Type == asdu.M_DP_NA_1 {
+			d, ok := v.Value.(uint8)
+			return d, ok
+		}
+	case asdu.C_SE_NB_1:
+		if v.Type == asdu.M_ME_NB_1 {
+			i, ok := v.Value.(int16)
+			return i, ok
+		}
+	case asdu.C_SE_NC_1:
+		if v.Type == asdu.M_ME_NC_1 || v.Type == asdu.M_ME_TF_1 {
+			f, ok := v.Value.(float32)
+			return f, ok
+		}
+	}
+	return nil, false
+}
+
 // OnASDU handles frames routed through ASDUHandler. Monitoring frames update
 // the image; COT 7/10 are recorded as confirmations; everything else is only
 // logged (with -log-frames). It never sends and never returns an error: a

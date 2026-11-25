@@ -58,7 +58,7 @@ go test ./...         # unit + loopback tests (loopback binds 127.0.0.1 on a fre
 | `-msl5-host` | `127.0.0.1` | MSL5 address to dial |
 | `-msl5-port` | `2404` | MSL5 IEC 104 port |
 | `-ca` | `1` | Common Address of all outgoing commands (incoming `M_*` are keyed by their own CA) |
-| `-cmd-interval` | `5s` | period of the command cycle; `0` = only send-on-change (nothing is sent on connect) |
+| `-cmd-interval` | `10s` | period of the command cycle; `0` = only send-on-change (nothing is sent on connect) |
 | `-cmd-on-change` | `true` | send the commands immediately (debounced 100 ms) when a command value changes |
 | `-reconnect` | `2s` | delay between reconnect attempts |
 | `-duration` | `0` | run this long, then exit (`0` = until Ctrl+C / SIGTERM) |
@@ -86,6 +86,24 @@ fresh, one information object per ASDU (`SQ=0`), always with **COT 6**, CA =
 | 302 | `C_SE_NC_1` | float32 |
 | 400 | `C_BO_NA_1` | uint32 |
 
+The value in this table is only the fallback. As soon as MSL5 has reported the
+point, a monitoring frame for the **same CA (`-ca`) + IOA** that maps onto the
+command type supplies the value instead:
+
+| Incoming `M_*` | Feeds |
+| :-- | :-- |
+| `M_SP_NA_1` (bool) | `C_SC_NA_1` |
+| `M_DP_NA_1` (0..3) | `C_DC_NA_1` |
+| `M_ME_NB_1` (int16) | `C_SE_NB_1` |
+| `M_ME_NC_1`, `M_ME_TF_1` (float32) | `C_SE_NC_1` |
+
+`C_SE_NA_1`, `C_RC_NA_1` and `C_BO_NA_1` have no compatible monitoring type in
+MSL5's contract (no `M_ME_NA_1`, and a counter reading is not a bit string), so
+they always carry the configured value; the same applies to a point whose
+monitoring row carries another CA. The lookup happens while a round is built:
+a received frame never triggers a send by itself, the next round carries the
+updated value (the `TX` log line shows it).
+
 Commands are sent only while the session is active: every `-cmd-interval`, and
 ≤ 100 ms after a value changed (`-cmd-on-change`). Send errors
 (`ErrNotActive`, `ErrUseClosedConnection`) are dropped silently,
@@ -100,7 +118,8 @@ Other types are only logged with `-log-frames`.
 
 COT 7 / COT 10 command frames are recorded as confirmations and neither executed
 nor answered, so MSL5's `ActCon` mirror can never re-arm the sender. Received
-data never triggers an outgoing frame.
+data never triggers an outgoing frame; the next command round picks the value
+up for the mapped types (see "Commands sent" above).
 
 At default verbosity only lifecycle lines are printed (connected, STARTDT
 confirmed, connection lost, unexpected send failures). `-log-frames` adds one
@@ -127,6 +146,7 @@ unit passes `-log-frames`.
 | `TestFrameLogGating` | no TX/RX output at default verbosity; `-log-frames` prints both |
 | `TestOutOfScopeRequestsAreNotAnswered` | GI, CI, read and clock sync are not answered |
 | `TestOutgoingCommandsUseActivation`, `TestDoubleCommandValueIsClamped` | all seven types: COT 6, CA, IOA, value, one object per ASDU |
+| `TestCommandValueComesFromImage`, `...TypeMismatchKeepsDefault`, `...IgnoresOtherCA`, `TestImageUpdateDoesNotSend` | commands carry the `M_*` value for the same CA + IOA, unmapped types keep the default, a received frame never sends |
 | `TestSendOnChange`, `TestSenderIdempotent`, `TestSendErrorsAreNotFatal` | send-on-change, Start/Stop concurrency, send errors |
 | `TestLoopbackAgainstRealServer`, `TestNoCommandLoop` | real client against an MSL5-like `cs104` server: STARTDT, commands + ActCon mirror, monitoring image, no loop, resume after server restart |
 
@@ -142,6 +162,10 @@ unit passes `-log-frames`.
   information-object buffer, so a mirror would be truncated. All frames are
   built fresh. The COT 44 mirror MSL5 used to return for the old `M_*` reports
   came from MSL5's server library, not from this client.
+* **Command values follow the monitoring image**: `sender.commandValue` asks
+  `station.CommandValue` for the point (`-ca` + IOA) before every send, so a
+  point MSL5 reports gets its last reported value. Read-only lookup inside a
+  round, never an RX-triggered send.
 
 ## Library limitation
 
@@ -155,7 +179,7 @@ MSL5 never sends them. Details: [`docs/iec104_library_bug_report.md`](docs/iec10
    `{"enabled":true,"ipAddress":"0.0.0.0","port":2404}` (state `listening`).
 2. Create an IN row (MSL5 → `M_*`, e.g. `M_ME_NC_1`, CA 1, IOA 301) and an OUT
    row (VK → `C_*`, e.g. `C_SC_NA_1`, CA 1, IOA 100) with linked channels.
-3. Start `iec104-client -msl5-host <msl5-ip> -msl5-port 2404 -ca 1 -cmd-interval 5s -log-frames`.
+3. Start `iec104-client -msl5-host <msl5-ip> -msl5-port 2404 -ca 1 -cmd-interval 10s -log-frames`.
 
 Expected: MSL5 reports `connected`, then `active`; the client log shows the IN
 row's `M_*` values; the OUT row's `responsePayload` shows the `C_*` frame with

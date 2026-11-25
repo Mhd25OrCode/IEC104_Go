@@ -253,7 +253,7 @@ func TestFrameLogGating(t *testing.T) {
 		})
 
 		conn := newCaptureConn(t)
-		snd := newSender(conn, 3, defaultCommandPoints(), 0, false, logFrames)
+		snd := newSender(conn, 3, defaultCommandPoints(), 0, false, logFrames, nil)
 		snd.Set(100, true)
 		tx = captureStdout(t, snd.sendAll)
 		return rx, tx
@@ -309,7 +309,7 @@ func TestOutOfScopeRequestsAreNotAnswered(t *testing.T) {
 }
 
 func newTestSender(conn asdu.Connect, interval time.Duration, onChange bool) *sender {
-	return newSender(conn, 3, defaultCommandPoints(), interval, onChange, false)
+	return newSender(conn, 3, defaultCommandPoints(), interval, onChange, false, nil)
 }
 
 func commandInfo(t *testing.T, sf *asdu.ASDU) (asdu.InfoObjAddr, any) {
@@ -464,4 +464,98 @@ func TestSendErrorsAreNotFatal(t *testing.T) {
 		snd.Stop()
 		conn.wantFrames(t, 0)
 	}
+}
+
+// imageSender returns a sender whose command values are resolved from st's
+// monitoring image, exactly as newClient wires it in production.
+func imageSender(t *testing.T, st *station, onChange bool) (*captureConn, *sender) {
+	t.Helper()
+	conn := newCaptureConn(t)
+	return conn, newSender(conn, 1, defaultCommandPoints(), 0, onChange, false, st)
+}
+
+// frameOfType returns the first captured frame of type typ.
+func frameOfType(t *testing.T, conn *captureConn, typ asdu.TypeID) *asdu.ASDU {
+	t.Helper()
+	for i := 0; i < conn.count(); i++ {
+		if sf := conn.frame(t, i); sf.Type == typ {
+			return sf
+		}
+	}
+	t.Fatalf("no %v frame sent", typ)
+	return nil
+}
+
+// TestCommandValueComesFromImage: a command point carries the value MSL5 last
+// reported for the same CA + IOA instead of the configured default.
+func TestCommandValueComesFromImage(t *testing.T) {
+	st := newStation(false)
+	feedMonitoring(t, st, 1)
+	conn, snd := imageSender(t, st, false)
+	snd.sendAll()
+	conn.wantFrames(t, len(defaultCommandPoints()))
+
+	want := []struct {
+		typ   asdu.TypeID
+		ioa   asdu.InfoObjAddr
+		value any
+	}{
+		{asdu.C_SC_NA_1, 100, true},
+		{asdu.C_DC_NA_1, 200, uint8(asdu.DPIDeterminedOff)},
+		{asdu.C_SE_NB_1, 303, int16(-42)},
+		{asdu.C_SE_NC_1, 302, float32(7.25)},
+	}
+	for _, w := range want {
+		ioa, v := commandInfo(t, frameOfType(t, conn, w.typ))
+		if ioa != w.ioa || v != w.value {
+			t.Errorf("%v = IOA %d value %v, want IOA %d value %v", w.typ, ioa, v, w.ioa, w.value)
+		}
+	}
+}
+
+// TestCommandValueTypeMismatchKeepsDefault: only a monitoring type that maps
+// onto the command type is used. An M_ME_NC_1 at IOA 301 must not feed the
+// int16 C_SE_NA_1, and a counter reading must not feed a C_BO_NA_1 bit string.
+func TestCommandValueTypeMismatchKeepsDefault(t *testing.T) {
+	st := newStation(false)
+	feedMonitoring(t, st, 1)
+	conn, snd := imageSender(t, st, false)
+	snd.sendAll()
+
+	if _, v := commandInfo(t, frameOfType(t, conn, asdu.C_SE_NA_1)); v != int16(0) {
+		t.Errorf("C_SE_NA_1 value = %v, want configured 0", v)
+	}
+	if _, v := commandInfo(t, frameOfType(t, conn, asdu.C_BO_NA_1)); v != uint32(0) {
+		t.Errorf("C_BO_NA_1 value = %v, want configured 0", v)
+	}
+	if _, v := commandInfo(t, frameOfType(t, conn, asdu.C_RC_NA_1)); v != uint8(1) {
+		t.Errorf("C_RC_NA_1 value = %v, want configured 1", v)
+	}
+}
+
+// TestCommandValueIgnoresOtherCA: monitoring rows on another CA never feed the
+// commands, which always carry -ca.
+func TestCommandValueIgnoresOtherCA(t *testing.T) {
+	st := newStation(false)
+	feedMonitoring(t, st, 2)
+	conn, snd := imageSender(t, st, false) // sender CA is 1
+	snd.sendAll()
+
+	if _, v := commandInfo(t, frameOfType(t, conn, asdu.C_SC_NA_1)); v != false {
+		t.Errorf("C_SC_NA_1 value = %v, want configured false", v)
+	}
+}
+
+// TestImageUpdateDoesNotSend: a monitoring frame only updates the image. Even
+// with send-on-change nothing is sent, so MSL5's own M_* frames can never
+// re-arm the sender (no command loop).
+func TestImageUpdateDoesNotSend(t *testing.T) {
+	st := newStation(false)
+	conn, snd := imageSender(t, st, true)
+	snd.Start()
+	defer snd.Stop()
+
+	feedMonitoring(t, st, 1)
+	time.Sleep(3 * kickDebounce)
+	conn.wantFrames(t, 0)
 }

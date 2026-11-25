@@ -16,6 +16,7 @@ import (
 type msl5LikeServer struct {
 	mu      sync.Mutex
 	cmds    []*asdu.ASDU
+	raws    [][]byte // same order as cmds, decoded lazily by lastValue
 	session asdu.Connect
 }
 
@@ -27,7 +28,13 @@ func (s *msl5LikeServer) ASDUHandler(c asdu.Connect, p *asdu.ASDU) error {
 		return nil
 	}
 	s.mu.Lock()
+	raw, err := p.MarshalBinary()
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.cmds = append(s.cmds, p)
+	s.raws = append(s.raws, raw)
 	s.mu.Unlock()
 	return p.SendReplyMirror(c, asdu.ActivationCon)
 }
@@ -60,6 +67,27 @@ func (s *msl5LikeServer) total() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.cmds)
+}
+
+// lastValue decodes the newest command of type typ the server received. The
+// frames are re-decoded from the raw bytes recorded per command, so the
+// getters' buffer consumption cannot truncate the ActCon mirror.
+func (s *msl5LikeServer) lastValue(t *testing.T, typ asdu.TypeID) (asdu.InfoObjAddr, any, bool) {
+	t.Helper()
+	s.mu.Lock()
+	raws := append([][]byte(nil), s.raws...)
+	s.mu.Unlock()
+	for i := len(raws) - 1; i >= 0; i-- {
+		sf := asdu.NewASDU(asdu.ParamsWide, asdu.Identifier{})
+		if err := sf.UnmarshalBinary(raws[i]); err != nil {
+			t.Fatalf("received frame %d does not decode: %v", i, err)
+		}
+		if sf.Type == typ {
+			ioa, v := commandInfo(t, sf)
+			return ioa, v, true
+		}
+	}
+	return 0, nil, false
 }
 
 func (s *msl5LikeServer) conn() asdu.Connect {
@@ -141,6 +169,15 @@ func TestLoopbackAgainstRealServer(t *testing.T) {
 		_, ok := st.Confirmation(pointKey{1, 100})
 		return ok
 	})
+
+	// The next round carries the value MSL5 reported for the same CA + IOA.
+	waitFor(t, "command value from the monitoring image", func() bool {
+		ioa, v, ok := h.lastValue(t, asdu.C_SC_NA_1)
+		return ok && ioa == 100 && v == true
+	})
+	if ioa, v, ok := h.lastValue(t, asdu.C_SE_NB_1); !ok || ioa != 303 || v != int16(-42) {
+		t.Errorf("C_SE_NB_1 = IOA %d value %v (%v), want IOA 303 value -42", ioa, v, ok)
+	}
 
 	// Only the periodic cycle may produce commands: every round is complete,
 	// so ActCon mirrors never trigger extra commands.

@@ -20,7 +20,7 @@ func main() {
 	msl5Host := flag.String("msl5-host", "127.0.0.1", "MSL5 IEC 104 server address to dial")
 	msl5Port := flag.Int("msl5-port", 2404, "MSL5 IEC 104 server port")
 	ca := flag.Uint("ca", 1, "Common Address of all outgoing commands")
-	cmdInterval := flag.Duration("cmd-interval", 5*time.Second, "period of the command cycle (0 = only send-on-change)")
+	cmdInterval := flag.Duration("cmd-interval", 10*time.Second, "period of the command cycle (0 = only send-on-change)")
 	cmdOnChange := flag.Bool("cmd-on-change", true, "send commands immediately (debounced) when a command value changes")
 	reconnect := flag.Duration("reconnect", 2*time.Second, "delay between reconnect attempts")
 	duration := flag.Duration("duration", 0, "run for this long, then exit (0 = until Ctrl+C)")
@@ -87,7 +87,7 @@ func newClient(addr string, ca asdu.CommonAddr, interval time.Duration, onChange
 	// Library logs are off by default and swallow ASDU decode errors.
 	cli.LogMode(lg.lib)
 
-	snd := newSender(cli, ca, defaultCommandPoints(), interval, onChange, lg.frames)
+	snd := newSender(cli, ca, defaultCommandPoints(), interval, onChange, lg.frames, st)
 
 	// MSL5 never sends STARTDT; the client must. Sends are only possible once
 	// STARTDT is confirmed, so the sender starts in the active handler.

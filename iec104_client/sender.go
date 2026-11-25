@@ -72,6 +72,7 @@ type sender struct {
 	interval  time.Duration
 	onChange  bool
 	logFrames bool
+	image     *station // optional process image: last M_* value per CA + IOA
 
 	mu     sync.Mutex // guards points, stop, done
 	points []commandPoint
@@ -80,7 +81,7 @@ type sender struct {
 	kick   chan struct{}
 }
 
-func newSender(conn asdu.Connect, ca asdu.CommonAddr, points []commandPoint, interval time.Duration, onChange, logFrames bool) *sender {
+func newSender(conn asdu.Connect, ca asdu.CommonAddr, points []commandPoint, interval time.Duration, onChange, logFrames bool, image *station) *sender {
 	return &sender{
 		conn:      conn,
 		ca:        ca,
@@ -88,6 +89,7 @@ func newSender(conn asdu.Connect, ca asdu.CommonAddr, points []commandPoint, int
 		interval:  interval,
 		onChange:  onChange,
 		logFrames: logFrames,
+		image:     image,
 		kick:      make(chan struct{}, 1),
 	}
 }
@@ -177,7 +179,8 @@ func (s *sender) loop(stop, done chan struct{}) {
 }
 
 // sendAll sends one command per point. The points are snapshotted first; the
-// mutex is never held while sending. A failed send aborts the round.
+// mutex is never held while sending. Each value comes from the monitoring image
+// when MSL5 reported one for the same CA + IOA. A failed send aborts the round.
 func (s *sender) sendAll() {
 	s.mu.Lock()
 	points := append([]commandPoint(nil), s.points...)
@@ -185,6 +188,8 @@ func (s *sender) sendAll() {
 
 	act := coa(asdu.Activation)
 	for _, p := range points {
+		v := s.commandValue(p)
+		p.Value = v
 		if err := s.send(p); err != nil {
 			if errors.Is(err, asdu.ErrTypeIDNotMatch) {
 				s.logf("command %v IOA=%d rejected by builder: %v\n", p.Type, p.IOA, err)
@@ -193,8 +198,21 @@ func (s *sender) sendAll() {
 			logSendError(p.Type.String(), err)
 			return
 		}
-		s.logf("TX %v %v CA=%d IOA=%d value=%v\n", p.Type, act, s.ca, p.IOA, p.Value)
+		s.logf("TX %v %v CA=%d IOA=%d value=%v\n", p.Type, act, s.ca, p.IOA, v)
 	}
+}
+
+// commandValue returns the value to send for p: the last monitoring value
+// received from MSL5 for the same CA + IOA when it maps onto the command type,
+// otherwise the configured value. Received frames never trigger a send; the
+// next round picks the new value up.
+func (s *sender) commandValue(p commandPoint) any {
+	if s.image != nil {
+		if v, ok := s.image.CommandValue(s.ca, p.IOA, p.Type); ok {
+			return v
+		}
+	}
+	return p.Value
 }
 
 func (s *sender) logf(format string, args ...any) {

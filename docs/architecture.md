@@ -67,7 +67,7 @@ MSL5 is a stock IEC 104 server; this client must satisfy the following
 | :-- | :-- |
 | `main.go` | flags (`-msl5-host`, `-msl5-port`, `-ca`, `-cmd-interval`, `-cmd-on-change`, `-reconnect`, `-duration`, `-log-frames`, `-verbose`), `newClient()` wiring, shutdown on `-duration` or SIGINT/SIGTERM |
 | `client_handler.go` | `clientHandler`: `cs104.ClientHandlerInterface` adapter; `ASDUHandler` → `station.OnASDU`, all other handlers ignore |
-| `handler.go` | `station` = monitoring image keyed by CA + IOA, recorded confirmations, `OnASDU` |
+| `handler.go` | `station` = monitoring image keyed by CA + IOA, recorded confirmations, `OnASDU`, `CommandValue` (image → command value) |
 | `confirm.go` | `coa()` and `newCommandASDU()` (fresh single-object ASDU) |
 | `sender.go` | `sender`: command points, Start/Stop/Kick/Set, `sendAll`, send-error handling |
 | `handler_test.go`, `loopback_test.go` | unit tests (capture connection) and loopback tests against an MSL5-like `cs104.Server` |
@@ -121,6 +121,13 @@ type station struct {
   200 `C_DC`, 250 `C_RC`, 301 `C_SE_NA`, 303 `C_SE_NB`, 302 `C_SE_NC`, 400 `C_BO`).
   Its mutex guards the points and is **never held during `Send`**: `sendAll`
   snapshots the points, releases the lock, then sends.
+* `sender.commandValue` asks `station.CommandValue` for each point before sending:
+  `M_SP_NA_1` → `C_SC_NA_1`, `M_DP_NA_1` → `C_DC_NA_1`, `M_ME_NB_1` → `C_SE_NB_1`,
+  `M_ME_NC_1`/`M_ME_TF_1` → `C_SE_NC_1`, keyed by `-ca` + IOA. `C_SE_NA_1`,
+  `C_RC_NA_1` and `C_BO_NA_1` have no compatible `M_*` in the MSL5 contract and
+  keep the configured value, as does any point whose monitoring row uses another
+  CA. The lookup is read-only and happens inside a round, so a received frame
+  still never triggers a send — it is applied by the next round.
 * The loop runs while the session is active: a round on start and every
   `-cmd-interval` (none when the interval is 0), and after `Set()` via `Kick` with a
   100 ms debounce when `-cmd-on-change` is set. `Kick` is a non-blocking write to
@@ -141,7 +148,9 @@ stored under the CA they carry.
 * Unit tests cover the monitoring image, confirmations (never executed or
   answered), frame-log gating (`-log-frames` off/on), ignored requests, the
   seven command types (COT 6, CA, IOA, value), send-on-change, sender lifecycle
-  and send errors.
+  and send errors; command values resolved from the monitoring image (per CA + IOA,
+  type-mapped) and the guarantee that an image update never sends
+  (`TestImageUpdateDoesNotSend`).
 * `loopback_test.go` runs the real `newClient` wiring against an MSL5-like
   `cs104.Server` on a free `127.0.0.1` port: STARTDT, commands mirrored as
   ActCon, monitoring image, no command loop, and resume after a server restart.
@@ -170,5 +179,7 @@ them either. See
 
 ## 11. Open items
 
-* Command values are static defaults (`defaultCommandPoints()`) apart from
-  `sender.Set()`; wiring them to real local inputs is out of scope.
+* Command values come from the monitoring image for the four mapped types
+  (see §6); the static defaults of `defaultCommandPoints()` are the fallback and
+  `sender.Set()` remains the hook for a future local input source. With
+  `-cmd-interval 0` an image update is only sent when `Set()` schedules a round.

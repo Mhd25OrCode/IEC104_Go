@@ -206,6 +206,13 @@ All seven builders accept **COT 6 (`asdu.Activation`)** and reject everything el
    read-only data for display/consumption; the command source (§4) is a separate image. Otherwise
    MSL5's echo of a command would re-arm the command sender and produce a permanent loop.
 
+> **Update (implemented).** The sender now *reads* the monitoring image while it
+> builds a round (`station.CommandValue` / `sender.commandValue`), so a point
+> with a compatible `M_*` for the same CA + IOA carries the value MSL5 last
+> reported (`M_SP_NA_1` → `C_SC_NA_1`, `M_DP_NA_1` → `C_DC_NA_1`,
+> `M_ME_NB_1` → `C_SE_NB_1`, `M_ME_NC_1`/`M_ME_TF_1` → `C_SE_NC_1`). The rule
+> above still holds: a received frame never triggers a send.
+
 ### 3.3 Expected behaviour
 
 - After the first `M_*` burst, `Snapshot()` contains entries for CA 1 / IOA 100, 200, 301, 302, 303, 400
@@ -253,7 +260,7 @@ type sender struct {
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-cmd-interval` | `5s` | period of the command cycle; `0` = only send-on-change |
+| `-cmd-interval` | `10s` | period of the command cycle; `0` = only send-on-change |
 | `-cmd-on-change` | `true` | send immediately (debounced) when a command value changes |
 | `-ca` | `1` | CA of all outgoing commands |
 
@@ -380,7 +387,7 @@ With no flags the unit log contains **only** lifecycle events:
 
 No per-frame lines. The shipped unit passes `-log-frames`, so journald also gets
 one `TX`/`RX` line per ASDU (at the default `-cmd-interval` that is ~7 sent
-commands plus ~7 received `ActCon` lines per 5 s; drop the flag or use
+commands plus ~7 received `ActCon` lines per 10 s; drop the flag or use
 `-cmd-interval 0` if that is too noisy on the Pi). `-verbose` additionally turns
 on the library's raw APDU log.
 
@@ -454,7 +461,7 @@ go build ./... && go vet ./... && go test -race ./... && test -z "$(gofmt -l .)"
 1. MSL5: `PUT /api/iec104/server` with `{"enabled":true,"ipAddress":"0.0.0.0","port":2404}`.
 2. MSL5: create at least one **IN** row (MSL5 → `M_*`) and one **OUT** row (VK → `C_*`) with matching
    CA/IOA/type and a linked channel.
-3. Run `./iec104-client -msl5-host <ip> -msl5-port 2404 -ca 1 -cmd-interval 5s -log-frames`.
+3. Run `./iec104-client -msl5-host <ip> -msl5-port 2404 -ca 1 -cmd-interval 10s -log-frames`.
 4. Expected:
    - `GET /api/iec104/server` → `active`;
    - client log shows the incoming `M_*` values of the MSL5 IN row;
