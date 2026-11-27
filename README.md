@@ -76,15 +76,15 @@ The sender holds one command point per type MSL5 accepts. Every frame is built
 fresh, one information object per ASDU (`SQ=0`), always with **COT 6**, CA =
 `-ca`:
 
-| IOA | Type | Value type |
-| :-- | :-- | :-- |
-| 100 | `C_SC_NA_1` | bool |
-| 200 | `C_DC_NA_1` | 0..3 (clamped) |
-| 250 | `C_RC_NA_1` | 0..3 (clamped) |
-| 301 | `C_SE_NA_1` | raw int16, **not** divided by 32768 |
-| 303 | `C_SE_NB_1` | int16 |
-| 302 | `C_SE_NC_1` | float32 |
-| 400 | `C_BO_NA_1` | uint32 |
+| IOA | Type | Value type | IOA High | IOA Middle | IOA Low |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| 100 | `C_SC_NA_1` | bool | 0 | 0 | 100 |
+| 200 | `C_DC_NA_1` | 0..3 (clamped) | 0 | 0 | 200 |
+| 250 | `C_RC_NA_1` | 0..3 (clamped) | 0 | 0 | 250 |
+| 301 | `C_SE_NA_1` | raw int16, **not** divided by 32768 | 0 | 1 | 45 |
+| 303 | `C_SE_NB_1` | int16 | 0 | 1 | 47 |
+| 302 | `C_SE_NC_1` | float32 | 0 | 1 | 46 |
+| 400 | `C_BO_NA_1` | uint32 | 0 | 1 | 144 |
 
 The value in this table is only the fallback. As soon as MSL5 has reported the
 point, a monitoring frame for the **same CA (`-ca`) + IOA** that maps onto the
